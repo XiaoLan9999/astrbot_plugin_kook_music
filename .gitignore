@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+.venv/
+venv/
+env/
+
+dist/
+build/
+*.zip
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime data and credentials
+data/
+bili_cookies.txt
+cookies.txt
+*.log

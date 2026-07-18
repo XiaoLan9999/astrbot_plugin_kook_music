@@ -1,0 +1,94 @@
+{
+    "default_platform": {
+        "description": "默认搜索平台",
+        "hint": "点歌时默认从哪个平台搜索歌曲。支持: netease(网易云), qq(QQ音乐), kugou(酷狗), kuwo(酷我), migu(咪咕), baidu(百度)",
+        "type": "string",
+        "options": [
+            "netease",
+            "qq",
+            "kugou",
+            "kuwo",
+            "migu",
+            "baidu"
+        ],
+        "default": "netease"
+    },
+    "streaming_mode": {
+        "description": "推流模式",
+        "hint": "relay: 中继管道推流，RTP 流不中断，切歌更流畅（推荐）；direct: 每首歌独立推流，切歌时重建 RTP 连接。如果播放第二首歌没有声音，请尝试切换模式。",
+        "type": "string",
+        "options": [
+            "relay",
+            "direct"
+        ],
+        "default": "relay"
+    },
+    "max_queue_size": {
+        "description": "最大播放队列长度",
+        "hint": "每个服务器允许排队的最大歌曲数量",
+        "type": "int",
+        "slider": {
+            "min": 10,
+            "max": 200,
+            "step": 10
+        },
+        "default": 50
+    },
+    "max_sessions": {
+        "description": "最大同时语音数",
+        "hint": "Bot 同时在多少个语音频道中播放音乐",
+        "type": "int",
+        "slider": {
+            "min": 1,
+            "max": 20,
+            "step": 1
+        },
+        "default": 5
+    },
+    "auto_leave_timeout": {
+        "description": "空闲自动退出(秒)",
+        "hint": "当播放队列为空时，等待多少秒后自动退出语音频道。设为 0 禁用",
+        "type": "int",
+        "slider": {
+            "min": 0,
+            "max": 600,
+            "step": 30
+        },
+        "default": 300
+    },
+    "volume": {
+        "description": "播放音量",
+        "hint": "FFmpeg 推流音量，0.01 ~ 1.0",
+        "type": "string",
+        "default": "0.15"
+    },
+    "search_limit": {
+        "description": "搜索结果数量",
+        "hint": "搜索歌曲时返回的最大结果数",
+        "type": "int",
+        "slider": {
+            "min": 1,
+            "max": 10,
+            "step": 1
+        },
+        "default": 5
+    },
+    "custom_ffmpeg_path": {
+        "description": "自定义 FFmpeg 路径",
+        "hint": "如果自动下载 FFmpeg 失败，可以在此手动指定 FFmpeg 可执行文件的绝对路径（如 C:/ffmpeg/bin/ffmpeg.exe）。留空则尝试自动下载或使用系统变量。",
+        "type": "string",
+        "default": ""
+    },
+    "kook_token": {
+        "description": "KOOK Bot Token",
+        "hint": "如果插件无法自动获取到 AstrBot 配置的 KOOK Token，请在此手动填入你的 KOOK 机器人 Token。",
+        "type": "string",
+        "default": ""
+    },
+    "bili_cookie": {
+        "description": "B站 Cookie",
+        "hint": "填入B站登录后的 Cookie（SESSDATA 值即可），用于播放需要登录或有地区限制的B站视频。获取方法：浏览器登录B站后按 F12 → Application → Cookies → 复制 SESSDATA 的值。留空则不使用。",
+        "type": "string",
+        "default": ""
+    }
+}
