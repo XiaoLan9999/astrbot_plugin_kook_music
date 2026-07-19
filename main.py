@@ -739,7 +739,7 @@ class KookMusicPlugin(Star):
 
     @filter.command("导入歌单")
     async def on_import_playlist(self, event: AstrMessageEvent):
-        """导入歌单 <歌单ID或链接> — 导入网易云歌单/电台到播放队列"""
+        """导入歌单 <歌单ID或链接> — 导入多平台歌单到播放队列"""
         if not self._is_kook(event):
             return
 
@@ -758,10 +758,12 @@ class KookMusicPlugin(Star):
         if not raw_text:
             yield event.plain_result(
                 "用法：导入歌单 <歌单ID或链接>\n"
-                "支持：普通歌单、电台(djradio)\n"
+                "支持：网易云、QQ音乐、酷狗音乐歌单及网易云电台\n"
+                "裸数字默认作为网易云歌单 ID；QQ/酷狗数字 ID 请写平台名。\n"
                 "例如：导入歌单 977171340\n"
-                "例如：导入歌单 https://music.163.com/#/playlist?id=977171340\n"
-                "例如：导入歌单 https://music.163.com/#/djradio?id=972583481"
+                "例如：导入歌单 qq 7706179315\n"
+                "例如：导入歌单 酷狗 6319673\n"
+                "也可以直接粘贴各平台的官方歌单链接。"
             )
             return
 
@@ -781,15 +783,24 @@ class KookMusicPlugin(Star):
                 old_entry[1].cancel()
             _playlist_import_requests[interaction_key] = request_marker
 
-        # 解析歌单链接/ID（自动识别普通歌单 vs 电台）
+        # 官方链接自动识别平台；裸数字保持兼容，仍默认网易云。
         import_type, target_id = PlaylistImporter.parse_playlist_input(raw_text)
         if not target_id:
             self._finish_playlist_import_request(interaction_key, request_marker)
-            yield event.plain_result("❌ 无法识别歌单/电台 ID，请检查输入")
+            yield event.plain_result(
+                "❌ 无法识别歌单/电台 ID，请检查链接；"
+                "QQ/酷狗数字 ID 需要同时写平台名"
+            )
             return
 
         # 发送进度提示
-        type_label = "电台" if import_type == "djradio" else "歌单"
+        type_labels = {
+            "netease": "网易云歌单",
+            "djradio": "网易云电台",
+            "qq": "QQ音乐歌单",
+            "kugou": "酷狗音乐歌单",
+        }
+        type_label = type_labels.get(import_type, "歌单")
         await event.send(event.plain_result(f"📥 正在导入{type_label} {target_id}，请稍候..."))
 
         # 根据类型选择导入方法
@@ -797,13 +808,23 @@ class KookMusicPlugin(Star):
             songs = await self.playlist_importer.import_netease_djradio(
                 target_id, requester_id, requester_name
             )
-        else:
+        elif import_type == "netease":
             songs = await self.playlist_importer.import_netease_playlist(
                 target_id,
                 requester_id,
                 requester_name,
                 fill_durations=False,
             )
+        elif import_type == "qq":
+            songs = await self.playlist_importer.import_qq_playlist(
+                target_id, requester_id, requester_name
+            )
+        elif import_type == "kugou":
+            songs = await self.playlist_importer.import_kugou_playlist(
+                target_id, requester_id, requester_name
+            )
+        else:
+            songs = []
 
         if _playlist_import_requests.get(interaction_key) is not request_marker:
             yield event.plain_result("ℹ️ 本次导入已由更新的歌单请求替换")
@@ -871,7 +892,7 @@ class KookMusicPlugin(Star):
             )
             return
 
-        if import_type != "djradio":
+        if import_type == "netease":
             await self.playlist_importer.enrich_netease_songs(songs)
 
         # 整批原子入队：等待期间即便其他用户继续点歌，也不会出现只加入
@@ -910,6 +931,7 @@ class KookMusicPlugin(Star):
             playlist_id=target_id,
             queue_size=queue_size,
             requester_name=requester_name,
+            platform=import_type,
         )
         if self._kook_token and channel_id:
             await send_card_message(self._kook_token, channel_id, result_card)

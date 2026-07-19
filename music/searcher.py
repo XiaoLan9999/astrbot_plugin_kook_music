@@ -279,6 +279,10 @@ class MusicSearcher:
             if album_mid
             else ""
         )
+        try:
+            duration = max(0, int(item.get("interval", 0) or 0) * 1000)
+        except (TypeError, ValueError):
+            duration = 0
         return Song(
             id=song_id,
             name=str(
@@ -288,7 +292,7 @@ class MusicSearcher:
                 or "未知歌曲"
             ),
             artists=artists or "未知歌手",
-            duration=cls._normalize_duration(item.get("interval", 0)),
+            duration=duration,
             cover_url=cover_url,
             platform="qq",
             extra_headers=dict(cls.QQ_AUDIO_HEADERS),
@@ -667,6 +671,8 @@ class MusicSearcher:
     async def fetch_audio_url(self, song: Song) -> Song:
         """按稳定歌曲 ID 刷新临时播放地址。"""
         if song.audio_url:
+            return song
+        if song.provider_data.get("resolver_status") == "denied":
             return song
 
         platform = self.resolve_platform(song.platform or "netease")

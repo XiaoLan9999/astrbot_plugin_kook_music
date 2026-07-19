@@ -343,6 +343,7 @@ def build_import_result_card(
     playlist_id: str,
     queue_size: int = 0,
     requester_name: str = "",
+    platform: str = "",
 ) -> dict:
     """构建歌单导入结果卡片"""
     modules = []
@@ -356,6 +357,9 @@ def build_import_result_card(
         f"**导入歌曲：** {total} 首",
         f"**队列总数：** {queue_size} 首",
     ]
+    if platform:
+        source = "网易云音乐" if platform == "djradio" else _platform_label(platform)
+        info_parts.insert(0, f"**来源：** {source}")
     modules.append({
         "type": "section",
         "text": {"type": "kmarkdown", "content": "  |  ".join(info_parts)}

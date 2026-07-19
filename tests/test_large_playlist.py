@@ -53,6 +53,16 @@ class LargePlaylistTests(unittest.TestCase):
             ("netease", "14301996301"),
         )
 
+    def test_import_result_card_displays_music_platform(self):
+        card = card_builder.build_import_result_card(
+            total=12,
+            playlist_id="123",
+            queue_size=14,
+            platform="qq",
+        )
+
+        self.assertIn("QQ音乐", str(card))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,19 +1,23 @@
 """
 歌单导入模块。
 
-支持通过网易云歌单链接/ID 批量导入歌曲到播放队列。
+支持通过网易云、QQ 音乐和酷狗音乐歌单链接/ID 批量导入歌曲到播放队列。
 支持导入网易云电台(djradio)节目列表。
 使用免登录第三方 API，无需本地部署 NeteaseCloudMusicApi。
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
-from urllib.parse import urlparse
+import time
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
 from .model import Song
+from .searcher import MusicSearcher
 
 logger = logging.getLogger("astrbot")
 
@@ -42,6 +46,35 @@ _PROGRAM_ID_FROM_PAGE = re.compile(r'program\?id=(\d+)')
 # 从 meting 返回的 url/pic/lrc 地址中提取歌曲 ID
 _METING_SONG_ID_PATTERN = re.compile(r"[?&]id=(\d+)")
 
+_QQ_PLAYLIST_PATH_PATTERN = re.compile(
+    r"/(?:n/)?(?:ryqq(?:_v2)?/playlist|yqq/playlist)/(\d+)(?:\.html)?(?:/|$)",
+    re.IGNORECASE,
+)
+_KUGOU_GCID_PATTERN = re.compile(r"\b(gcid_[a-z0-9]+)\b", re.IGNORECASE)
+_KUGOU_COLLECTION_PATTERN = re.compile(
+    r"\b(collection_[a-z0-9_-]+)\b", re.IGNORECASE
+)
+_KUGOU_SPECIAL_PATH_PATTERNS = (
+    re.compile(r"/yy/special/single/(\d+)(?:\.html)?(?:/|$)", re.IGNORECASE),
+    re.compile(r"/plist/list/(\d+)(?:\.html)?(?:/|$)", re.IGNORECASE),
+    re.compile(r"/(?:special|playlist)/(\d+)(?:\.html)?(?:/|$)", re.IGNORECASE),
+)
+
+_PLAYLIST_PLATFORM_ALIASES = {
+    "netease": "netease",
+    "网易": "netease",
+    "网易云": "netease",
+    "网易云音乐": "netease",
+    "qq": "qq",
+    "qq音乐": "qq",
+    "腾讯": "qq",
+    "腾讯音乐": "qq",
+    "kugou": "kugou",
+    "kg": "kugou",
+    "酷狗": "kugou",
+    "酷狗音乐": "kugou",
+}
+
 
 class PlaylistImporter:
     """歌单导入器"""
@@ -53,6 +86,40 @@ class PlaylistImporter:
     )
     NETEASE_SONG_API = "https://api.qijieya.cn/meting/?type=song&id={song_id}"
     NETEASE_SONG_DETAIL_API = "https://music.163.com/api/song/detail/?id={song_id}&ids=[{song_ids}]"
+    QQ_PLAYLIST_API = "https://u.y.qq.com/cgi-bin/musicu.fcg"
+    QQ_LEGACY_PLAYLIST_API = (
+        "https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg"
+    )
+    QQ_PLAYLIST_PAGE_SIZE = 500
+    KUGOU_SPECIAL_SONG_API = "https://mobiles.kugou.com/api/v3/special/song"
+    KUGOU_PLAYLIST_INFO_V2_API = (
+        "https://mobiles.kugou.com/api/v5/special/info_v2"
+    )
+    KUGOU_PLAYLIST_SONG_V2_API = (
+        "https://mobiles.kugou.com/api/v5/special/song_v2"
+    )
+    KUGOU_GCID_DECODE_API = "https://t.kugou.com/v1/songlist/batch_decode"
+    KUGOU_COLLECTION_API = (
+        "https://gateway.kugou.com/pubsongs/v2/get_other_list_file_nofilt"
+    )
+    KUGOU_COLLECTION_PAGE_SIZE = 300
+    KUGOU_APP_ID = 1005
+    KUGOU_CLIENT_VERSION = 20489
+    KUGOU_DECODE_CLIENT_VERSION = 20109
+    KUGOU_SIGNATURE_SALT = "OIlwieks28dk2k092lksi2UIkp"
+    KUGOU_WEB_APP_ID = 1058
+    KUGOU_WEB_SOURCE_APP_ID = 2919
+    KUGOU_WEB_CLIENT_VERSION = 20000
+    KUGOU_WEB_DEVICE_ID = "1586163242519"
+    KUGOU_WEB_SIGNATURE_SALT = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt"
+    KUGOU_PLAYLIST_WEB_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) "
+            "AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 "
+            "Mobile/15A372 Safari/604.1"
+        ),
+        "Referer": "https://m3ws.kugou.com/share/index.php",
+    }
 
     def __init__(self):
         self._session: aiohttp.ClientSession | None = None
@@ -68,32 +135,1014 @@ class PlaylistImporter:
 
     @staticmethod
     def parse_playlist_input(text: str) -> tuple[str, str]:
-        """解析用户输入的歌单链接或 ID。
+        """解析网易云、QQ 音乐或酷狗音乐歌单链接/ID。
 
         Args:
             text: 用户输入（歌单 ID 或包含 ID 的链接）
 
         Returns:
-            (type, id) — type 为 "netease" 或 "djradio"
+            (type, id) — type 为 netease、djradio、qq 或 kugou
             id 为空字符串表示解析失败
         """
         text = text.strip()
+        if not text:
+            return "netease", ""
 
-        # 优先检测电台链接（djradio 关键词）
-        m = _NETEASE_DJRADIO_ID_PATTERN.search(text)
-        if m:
-            return "djradio", m.group(1)
+        url_match = re.search(r"https?://[^\s]+", text, re.IGNORECASE)
+        if url_match:
+            url = url_match.group(0).rstrip(",.;，。；>)]】）")
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            path_and_fragment = f"{parsed.path}#{parsed.fragment}"
+            query = {
+                key.lower(): values for key, values in parse_qs(parsed.query).items()
+            }
+            fragment_query = {
+                key.lower(): values
+                for key, values in parse_qs(
+                    parsed.fragment.split("?", 1)[1]
+                    if "?" in parsed.fragment
+                    else ""
+                ).items()
+            }
 
-        # 纯数字 → 直接作为歌单 ID
+            if PlaylistImporter._host_matches(host, "music.163.com"):
+                if "djradio" in path_and_fragment.lower():
+                    target_id = PlaylistImporter._first_numeric_param(
+                        query, fragment_query
+                    )
+                    if not target_id:
+                        match = _NETEASE_DJRADIO_ID_PATTERN.search(url)
+                        target_id = match.group(1) if match else ""
+                    return "djradio", target_id
+
+                target_id = PlaylistImporter._first_numeric_param(
+                    query, fragment_query
+                )
+                if not target_id:
+                    match = _NETEASE_PLAYLIST_ID_PATTERN.search(url)
+                    target_id = match.group(1) if match else ""
+                return "netease", target_id
+
+            if PlaylistImporter._host_matches(host, "y.qq.com"):
+                match = _QQ_PLAYLIST_PATH_PATTERN.search(parsed.path)
+                target_id = match.group(1) if match else ""
+                if not target_id and (
+                    "playlist" in parsed.path.lower()
+                    or "taoge" in parsed.path.lower()
+                ):
+                    target_id = PlaylistImporter._first_numeric_param(
+                        query, fragment_query
+                    )
+                return "qq", target_id
+
+            if PlaylistImporter._host_matches(host, "kugou.com"):
+                match = _KUGOU_GCID_PATTERN.search(url)
+                if match:
+                    return "kugou", match.group(1).lower()
+                match = _KUGOU_COLLECTION_PATTERN.search(url)
+                if match:
+                    return "kugou", match.group(1).lower()
+                for pattern in _KUGOU_SPECIAL_PATH_PATTERNS:
+                    match = pattern.search(parsed.path)
+                    if match:
+                        return "kugou", match.group(1)
+                for key in ("specialid", "special_id", "playlistid", "listid"):
+                    values = query.get(key)
+                    if values and str(values[0]).isdigit():
+                        return "kugou", str(values[0])
+                if any(
+                    keyword in parsed.path.lower()
+                    for keyword in ("playlist", "special", "songlist", "plist")
+                ):
+                    target_id = PlaylistImporter._first_numeric_param(query)
+                    return "kugou", target_id
+                return "kugou", ""
+
+            return "netease", ""
+
+        normalized = re.sub(r"\s*[:：]\s*", " ", text).strip()
+        parts = normalized.split()
+        if len(parts) == 2:
+            first_platform = _PLAYLIST_PLATFORM_ALIASES.get(parts[0].lower())
+            last_platform = _PLAYLIST_PLATFORM_ALIASES.get(parts[1].lower())
+            if first_platform:
+                return PlaylistImporter._parse_explicit_playlist_id(
+                    first_platform, parts[1]
+                )
+            if last_platform:
+                return PlaylistImporter._parse_explicit_playlist_id(
+                    last_platform, parts[0]
+                )
+
+        match = _KUGOU_GCID_PATTERN.fullmatch(text)
+        if match:
+            return "kugou", match.group(1).lower()
+        match = _KUGOU_COLLECTION_PATTERN.fullmatch(text)
+        if match:
+            return "kugou", match.group(1).lower()
+
+        # 兼容旧版无协议网易云输入，例如 playlist?id=123。
+        if "djradio" in text.lower():
+            match = _NETEASE_DJRADIO_ID_PATTERN.search(text)
+            if match:
+                return "djradio", match.group(1)
+        if "playlist" in text.lower():
+            match = _NETEASE_PLAYLIST_ID_PATTERN.search(text)
+            if match:
+                return "netease", match.group(1)
+
+        # 裸数字保持历史行为，默认视为网易云歌单 ID。
         if text.isdigit():
             return "netease", text
-
-        # 从链接中提取歌单 ID
-        m = _NETEASE_PLAYLIST_ID_PATTERN.search(text)
-        if m:
-            return "netease", m.group(1)
-
         return "netease", ""
+
+    @staticmethod
+    def _host_matches(host: str, domain: str) -> bool:
+        return host == domain or host.endswith("." + domain)
+
+    @staticmethod
+    def _first_numeric_param(*param_groups: dict) -> str:
+        for params in param_groups:
+            for key in ("id", "playlistid", "disstid", "specialid", "listid"):
+                values = params.get(key)
+                if values and str(values[0]).isdigit():
+                    return str(values[0])
+        return ""
+
+    @staticmethod
+    def _parse_explicit_playlist_id(platform: str, value: str) -> tuple[str, str]:
+        value = value.strip()
+        if platform in {"netease", "qq"}:
+            return platform, value if value.isdigit() else ""
+        if platform == "kugou":
+            if value.isdigit():
+                return platform, value
+            match = _KUGOU_GCID_PATTERN.fullmatch(value)
+            if match:
+                return platform, match.group(1).lower()
+            match = _KUGOU_COLLECTION_PATTERN.fullmatch(value)
+            if match:
+                return platform, match.group(1).lower()
+        return platform, ""
+
+    async def import_qq_playlist(
+        self,
+        playlist_id: str,
+        requester_id: str = "",
+        requester_name: str = "",
+    ) -> list[Song]:
+        """分页导入 QQ 音乐歌单，播放地址在真正播放前再解析。"""
+        session = await self._get_session()
+        legacy_songs = await self._fetch_qq_legacy_playlist(
+            session, playlist_id, requester_id, requester_name
+        )
+        if legacy_songs is not None:
+            logger.info(
+                f"[KookMusic] QQ音乐歌单 {playlist_id} 导入成功: "
+                f"{len(legacy_songs)} 首歌曲"
+            )
+            return legacy_songs
+
+        # 旧接口故障时回退到当前 musicu 分页接口；分页按固定步长推进。
+        for attempt in range(2):
+            songs = await self._fetch_qq_playlist_once(
+                session, playlist_id, requester_id, requester_name
+            )
+            if songs is not None:
+                logger.info(
+                    f"[KookMusic] QQ音乐歌单 {playlist_id} 导入成功: "
+                    f"{len(songs)} 首歌曲"
+                )
+                return songs
+            if attempt == 0:
+                logger.warning(
+                    f"[KookMusic] QQ音乐歌单 {playlist_id} 分页期间发生变化，"
+                    "正在重新读取"
+                )
+        return []
+
+    async def _fetch_qq_legacy_playlist(
+        self,
+        session: aiohttp.ClientSession,
+        playlist_id: str,
+        requester_id: str,
+        requester_name: str,
+    ) -> list[Song] | None:
+        try:
+            async with session.get(
+                self.QQ_LEGACY_PLAYLIST_API,
+                params={
+                    "type": 1,
+                    "utf8": 1,
+                    "format": "json",
+                    "disstid": playlist_id,
+                },
+                headers={
+                    "User-Agent": MusicSearcher.HEADERS["User-Agent"],
+                    "Referer": "https://y.qq.com/",
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                result = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning(f"[KookMusic] QQ音乐完整歌单接口读取异常: {e}")
+            return None
+
+        cdlist = result.get("cdlist", []) if isinstance(result, dict) else []
+        if (
+            not isinstance(result, dict)
+            or result.get("code") != 0
+            or not isinstance(cdlist, list)
+            or not cdlist
+        ):
+            return None
+        playlist = cdlist[0] if isinstance(cdlist[0], dict) else {}
+        response_id = str(playlist.get("disstid", "") or "")
+        if response_id and response_id != playlist_id:
+            logger.warning(
+                f"[KookMusic] QQ音乐完整歌单 ID 不匹配: "
+                f"请求 {playlist_id}, 返回 {response_id}"
+            )
+            return None
+        raw_songs = playlist.get("songlist", [])
+        if not isinstance(raw_songs, list):
+            return None
+        try:
+            total = int(playlist.get("total_song_num", len(raw_songs)))
+        except (TypeError, ValueError):
+            return None
+        if len(raw_songs) != total:
+            logger.warning(
+                f"[KookMusic] QQ音乐完整歌单返回不完整: "
+                f"expected={total}, actual={len(raw_songs)}"
+            )
+            return None
+
+        songs: list[Song] = []
+        for index, item in enumerate(raw_songs, start=1):
+            song = MusicSearcher._parse_qq_track(item, require_free=False)
+            if song is None:
+                song = self._qq_unavailable_placeholder(item, index)
+            song.requester_id = requester_id
+            song.requester_name = requester_name
+            songs.append(song)
+        return songs
+
+    @staticmethod
+    def _qq_unavailable_placeholder(item: object, index: int) -> Song:
+        item = item if isinstance(item, dict) else {}
+        song_id = str(
+            item.get("mid", "")
+            or item.get("songmid", "")
+            or item.get("id", "")
+            or item.get("songid", "")
+            or f"unavailable-{index}"
+        )
+        singers = item.get("singer") if isinstance(item.get("singer"), list) else []
+        artists = "、".join(
+            str(singer.get("name", ""))
+            for singer in singers
+            if isinstance(singer, dict) and singer.get("name")
+        )
+        return Song(
+            id=song_id,
+            name=str(
+                item.get("name", "")
+                or item.get("songname", "")
+                or item.get("title", "")
+                or "已下架歌曲"
+            ),
+            artists=artists or "未知歌手",
+            platform="qq",
+            extra_headers=dict(MusicSearcher.QQ_AUDIO_HEADERS),
+            unplayable_reason="QQ 音乐已下架或缺少可解析歌曲 ID",
+            provider_data={"resolver_status": "denied"},
+        )
+
+    async def _fetch_qq_playlist_once(
+        self,
+        session: aiohttp.ClientSession,
+        playlist_id: str,
+        requester_id: str,
+        requester_name: str,
+    ) -> list[Song] | None:
+        songs: list[Song] = []
+        begin = 0
+        first_mtime: str | None = None
+        expected_total: int | None = None
+        consumed_count = 0
+        filtered_count = 0
+        invalid_count = 0
+
+        for _page in range(2000):
+            body = {
+                "comm": MusicSearcher._qq_web_comm(),
+                "req_0": {
+                    "module": "music.srfDissInfo.aiDissInfo",
+                    "method": "uniform_get_Dissinfo",
+                    "param": {
+                        "disstid": int(playlist_id),
+                        "enc_host_uin": "",
+                        "tag": 1,
+                        "userinfo": 1,
+                        "song_begin": begin,
+                        "song_num": self.QQ_PLAYLIST_PAGE_SIZE,
+                    },
+                },
+            }
+            try:
+                async with session.post(
+                    self.QQ_PLAYLIST_API,
+                    json=body,
+                    headers={
+                        **MusicSearcher.HEADERS,
+                        "Referer": f"https://y.qq.com/n/ryqq/playlist/{playlist_id}",
+                        "Origin": "https://y.qq.com",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"[KookMusic] QQ音乐歌单读取失败: HTTP {resp.status}"
+                        )
+                        return []
+                    result = await resp.json(content_type=None)
+            except Exception as e:
+                logger.warning(f"[KookMusic] QQ音乐歌单读取异常: {e}")
+                return []
+
+            request_data = result.get("req_0") if isinstance(result, dict) else None
+            data = request_data.get("data") if isinstance(request_data, dict) else None
+            if (
+                not isinstance(result, dict)
+                or result.get("code") != 0
+                or not isinstance(request_data, dict)
+                or request_data.get("code") != 0
+                or not isinstance(data, dict)
+                or data.get("code") != 0
+            ):
+                logger.warning("[KookMusic] QQ音乐歌单接口返回格式或状态异常")
+                return []
+
+            dirinfo = data.get("dirinfo") if isinstance(data.get("dirinfo"), dict) else {}
+            response_id = str(dirinfo.get("id", "") or "")
+            if response_id and response_id != playlist_id:
+                logger.warning(
+                    f"[KookMusic] QQ音乐歌单 ID 不匹配: "
+                    f"请求 {playlist_id}, 返回 {response_id}"
+                )
+                return []
+
+            current_mtime = str(dirinfo.get("mtime", "") or "")
+            if first_mtime is None:
+                first_mtime = current_mtime
+            elif current_mtime and first_mtime and current_mtime != first_mtime:
+                return None
+            try:
+                current_total = int(
+                    dirinfo.get("songnum", data.get("total_song_num", 0)) or 0
+                )
+            except (TypeError, ValueError):
+                current_total = 0
+            if current_total > 0:
+                if expected_total is None:
+                    expected_total = current_total
+                elif current_total != expected_total:
+                    return None
+
+            raw_songs = data.get("songlist", [])
+            if not isinstance(raw_songs, list):
+                return []
+            filtered = data.get("filtered_song", [])
+            invalid = data.get("invalid_song", [])
+            if isinstance(filtered, list):
+                filtered_count += len(filtered)
+            if isinstance(invalid, list):
+                invalid_count += len(invalid)
+            consumed_count += len(raw_songs)
+            if isinstance(filtered, list):
+                consumed_count += len(filtered)
+            if isinstance(invalid, list):
+                consumed_count += len(invalid)
+
+            for item_index, item in enumerate(raw_songs, start=1):
+                song = MusicSearcher._parse_qq_track(item, require_free=False)
+                if song is None:
+                    invalid_count += 1
+                    song = self._qq_unavailable_placeholder(
+                        item, begin + item_index
+                    )
+                song.requester_id = requester_id
+                song.requester_name = requester_name
+                songs.append(song)
+            unavailable = []
+            if isinstance(filtered, list):
+                unavailable.extend(filtered)
+            if isinstance(invalid, list):
+                unavailable.extend(invalid)
+            for item_index, item in enumerate(unavailable, start=1):
+                song = self._qq_unavailable_placeholder(
+                    item, begin + len(raw_songs) + item_index
+                )
+                song.requester_id = requester_id
+                song.requester_name = requester_name
+                songs.append(song)
+
+            has_more = bool(data.get("hasmore"))
+            if not has_more:
+                if expected_total is not None and consumed_count != expected_total:
+                    logger.warning(
+                        f"[KookMusic] QQ音乐分页歌单内容不完整: "
+                        f"expected={expected_total}, actual={consumed_count}"
+                    )
+                    return None
+                if filtered_count or invalid_count:
+                    logger.info(
+                        f"[KookMusic] QQ音乐歌单 {playlist_id} 已忽略 "
+                        f"{filtered_count + invalid_count} 条平台过滤/无效记录"
+                    )
+                return songs
+            if not raw_songs and not filtered and not invalid:
+                logger.warning("[KookMusic] QQ音乐歌单分页提前返回空页")
+                return []
+
+            # 即使当前页有平台过滤项，也必须按请求页长推进，不能按返回数推进。
+            begin += self.QQ_PLAYLIST_PAGE_SIZE
+
+        logger.warning("[KookMusic] QQ音乐歌单分页超过安全上限")
+        return []
+
+    async def import_kugou_playlist(
+        self,
+        playlist_id: str,
+        requester_id: str = "",
+        requester_name: str = "",
+    ) -> list[Song]:
+        """导入酷狗数字 specialid 或官网 gcid/global collection 歌单。"""
+        session = await self._get_session()
+        if playlist_id.isdigit():
+            collection_id = await self._resolve_kugou_special_id(
+                session, playlist_id
+            )
+            if collection_id:
+                songs = await self._fetch_kugou_collection_playlist(
+                    session, collection_id, requester_id, requester_name
+                )
+            else:
+                # 旧数字接口作为临时兼容兜底；正常路径统一使用 song_v2。
+                songs = await self._fetch_kugou_special_playlist(
+                    session, playlist_id, requester_id, requester_name
+                )
+        else:
+            collection_id = playlist_id
+            if playlist_id.lower().startswith("gcid_"):
+                collection_id = await self._decode_kugou_gcid(session, playlist_id)
+            if not _KUGOU_COLLECTION_PATTERN.fullmatch(collection_id or ""):
+                logger.warning(f"[KookMusic] 无法解析酷狗歌单 ID: {playlist_id}")
+                return []
+            songs = await self._fetch_kugou_collection_playlist(
+                session, collection_id, requester_id, requester_name
+            )
+
+        if songs:
+            logger.info(
+                f"[KookMusic] 酷狗音乐歌单 {playlist_id} 导入成功: "
+                f"{len(songs)} 首歌曲"
+            )
+        return songs
+
+    async def _resolve_kugou_special_id(
+        self,
+        session: aiohttp.ClientSession,
+        special_id: str,
+    ) -> str:
+        params = self._kugou_web_params()
+        params.update({"specialid": special_id, "format": "jsonp"})
+        params["signature"] = self._kugou_web_signature(params)
+        try:
+            async with session.get(
+                self.KUGOU_PLAYLIST_INFO_V2_API,
+                params=params,
+                headers=self._kugou_web_headers(params),
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    return ""
+                result = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning(f"[KookMusic] 酷狗 specialid 转换异常: {e}")
+            return ""
+
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, dict):
+            return ""
+        collection_id = str(
+            data.get("global_specialid", "")
+            or data.get("global_collection_id", "")
+            or ""
+        ).lower()
+        return (
+            collection_id
+            if _KUGOU_COLLECTION_PATTERN.fullmatch(collection_id)
+            else ""
+        )
+
+    async def _fetch_kugou_special_playlist(
+        self,
+        session: aiohttp.ClientSession,
+        special_id: str,
+        requester_id: str,
+        requester_name: str,
+    ) -> list[Song]:
+        raw_items: list[dict] = []
+        total: int | None = None
+        page = 1
+        page_size = self.KUGOU_COLLECTION_PAGE_SIZE
+        while page <= 2000:
+            try:
+                async with session.get(
+                    self.KUGOU_SPECIAL_SONG_API,
+                    params={
+                        "specialid": special_id,
+                        "area_code": 1,
+                        "page": page,
+                        "plat": 2,
+                        "pagesize": page_size,
+                        "version": 8990,
+                    },
+                    headers={
+                        "User-Agent": MusicSearcher.HEADERS["User-Agent"],
+                        "Referer": "https://www.kugou.com/",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"[KookMusic] 酷狗歌单读取失败: HTTP {resp.status}"
+                        )
+                        return []
+                    result = await resp.json(content_type=None)
+            except Exception as e:
+                logger.warning(f"[KookMusic] 酷狗歌单读取异常: {e}")
+                return []
+
+            data = result.get("data") if isinstance(result, dict) else None
+            info = data.get("info", []) if isinstance(data, dict) else None
+            if (
+                not isinstance(result, dict)
+                or result.get("status") != 1
+                or not isinstance(info, list)
+            ):
+                return []
+            try:
+                current_total = int(data.get("total", len(info)))
+            except (TypeError, ValueError):
+                return []
+            if total is None:
+                total = current_total
+            elif current_total != total:
+                logger.warning("[KookMusic] 酷狗歌单在分页读取期间发生变化")
+                return []
+            raw_items.extend(item for item in info if isinstance(item, dict))
+            if len(raw_items) >= total:
+                break
+            if not info:
+                logger.warning("[KookMusic] 酷狗歌单分页提前返回空页")
+                return []
+            page += 1
+
+        if total is None or len(raw_items) != total:
+            logger.warning(
+                f"[KookMusic] 酷狗歌单内容不完整: "
+                f"expected={total}, actual={len(raw_items)}"
+            )
+            return []
+        return self._parse_kugou_playlist_songs(
+            raw_items, requester_id, requester_name
+        )
+
+    async def _decode_kugou_gcid(
+        self,
+        session: aiohttp.ClientSession,
+        gcid: str,
+    ) -> str:
+        body = json.dumps(
+            {"ret_info": 1, "data": [{"id": gcid.lower(), "id_type": 2}]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        params = {
+            "dfid": "-",
+            "appid": self.KUGOU_APP_ID,
+            "mid": "0",
+            "clientver": self.KUGOU_DECODE_CLIENT_VERSION,
+            "clienttime": int(time.time()),
+            "uuid": "-",
+        }
+        params["signature"] = self._kugou_signature(params, body)
+        try:
+            async with session.post(
+                self.KUGOU_GCID_DECODE_API,
+                params=params,
+                data=body.encode("utf-8"),
+                headers={
+                    "User-Agent": MusicSearcher.HEADERS["User-Agent"],
+                    "Referer": "https://www.kugou.com/",
+                    "Content-Type": "application/json",
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    return ""
+                result = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning(f"[KookMusic] 酷狗 gcid 解码异常: {e}")
+            return ""
+
+        data = result.get("data") if isinstance(result, dict) else None
+        items = data.get("list", []) if isinstance(data, dict) else []
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != 1
+            or not isinstance(items, list)
+            or not items
+        ):
+            return ""
+        item = items[0] if isinstance(items[0], dict) else {}
+        return str(item.get("global_collection_id", "") or "").lower()
+
+    async def _fetch_kugou_collection_playlist(
+        self,
+        session: aiohttp.ClientSession,
+        collection_id: str,
+        requester_id: str,
+        requester_name: str,
+    ) -> list[Song]:
+        # nofilt 保留官网歌单中的原始顺序和已下架占位，区间序号不会偏移。
+        for attempt in range(2):
+            raw_items = await self._fetch_kugou_nofilt_once(
+                session, collection_id
+            )
+            if raw_items is not None:
+                return self._parse_kugou_playlist_songs(
+                    raw_items, requester_id, requester_name
+                )
+            if attempt == 0:
+                logger.warning(
+                    f"[KookMusic] 酷狗歌单 {collection_id} 分页期间发生变化，"
+                    "正在重新读取"
+                )
+
+        logger.warning(
+            f"[KookMusic] 酷狗完整歌单接口暂时不可用，"
+            f"使用过滤后的 song_v2 兜底: {collection_id}"
+        )
+        for _attempt in range(2):
+            raw_items = await self._fetch_kugou_playlist_v2_once(
+                session, collection_id
+            )
+            if raw_items is not None:
+                return self._parse_kugou_playlist_songs(
+                    raw_items, requester_id, requester_name
+                )
+        return []
+
+    async def _fetch_kugou_nofilt_once(
+        self,
+        session: aiohttp.ClientSession,
+        collection_id: str,
+    ) -> list[dict] | None:
+        raw_items: list[dict] = []
+        total: int | None = None
+        update_time: str | None = None
+        begin = 0
+
+        for _page in range(2000):
+            params = {
+                "dfid": "-",
+                "mid": "0",
+                "uuid": "-",
+                "appid": self.KUGOU_APP_ID,
+                "clientver": self.KUGOU_CLIENT_VERSION,
+                "clienttime": int(time.time()),
+                "area_code": 1,
+                "begin_idx": begin,
+                "plat": 1,
+                "type": 1,
+                "mode": 1,
+                "personal_switch": 1,
+                "extend_fields": "abtags,hot_cmt,popularization",
+                "pagesize": self.KUGOU_COLLECTION_PAGE_SIZE,
+                "global_collection_id": collection_id,
+            }
+            params["signature"] = self._kugou_signature(params)
+            try:
+                async with session.get(
+                    self.KUGOU_COLLECTION_API,
+                    params=params,
+                    headers={
+                        "User-Agent": (
+                            "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"
+                        ),
+                        "dfid": "-",
+                        "mid": "0",
+                        "clienttime": str(params["clienttime"]),
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    result = await resp.json(content_type=None)
+            except Exception as e:
+                logger.warning(f"[KookMusic] 酷狗 nofilt 歌单读取异常: {e}")
+                return None
+
+            data = result.get("data") if isinstance(result, dict) else None
+            page_items = data.get("songs", []) if isinstance(data, dict) else None
+            if (
+                not isinstance(result, dict)
+                or result.get("error_code") != 0
+                or not isinstance(page_items, list)
+            ):
+                return None
+            try:
+                current_total = int(data.get("count", len(page_items)))
+            except (TypeError, ValueError):
+                return None
+            list_info = (
+                data.get("list_info")
+                if isinstance(data.get("list_info"), dict)
+                else {}
+            )
+            current_update = str(list_info.get("update_time", "") or "")
+            if total is None:
+                total = current_total
+                update_time = current_update
+            elif current_total != total or (
+                update_time and current_update and current_update != update_time
+            ):
+                return None
+
+            raw_items.extend(item for item in page_items if isinstance(item, dict))
+            if len(raw_items) >= total:
+                break
+            if not page_items:
+                logger.warning("[KookMusic] 酷狗 nofilt 歌单分页提前返回空页")
+                return None
+            begin += self.KUGOU_COLLECTION_PAGE_SIZE
+
+        if total is None or len(raw_items) != total:
+            logger.warning(
+                f"[KookMusic] 酷狗 nofilt 歌单内容不完整: "
+                f"expected={total}, actual={len(raw_items)}"
+            )
+            return None
+        return raw_items
+
+    async def _fetch_kugou_playlist_v2_once(
+        self,
+        session: aiohttp.ClientSession,
+        collection_id: str,
+    ) -> list[dict] | None:
+        raw_items: list[dict] = []
+        total: int | None = None
+
+        for page in range(1, 2001):
+            params = self._kugou_web_params()
+            params.update({
+                "global_specialid": collection_id,
+                "specialid": 0,
+                "plat": 0,
+                "version": 8000,
+                "page": page,
+                "pagesize": self.KUGOU_COLLECTION_PAGE_SIZE,
+            })
+            params["signature"] = self._kugou_web_signature(params)
+            try:
+                async with session.get(
+                    self.KUGOU_PLAYLIST_SONG_V2_API,
+                    params=params,
+                    headers=self._kugou_web_headers(params),
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    result = await resp.json(content_type=None)
+            except Exception as e:
+                logger.warning(f"[KookMusic] 酷狗 song_v2 歌单读取异常: {e}")
+                return None
+
+            data = result.get("data") if isinstance(result, dict) else None
+            page_items = data.get("info", []) if isinstance(data, dict) else None
+            if isinstance(data, dict) and not page_items:
+                page_items = data.get("list", []) or data.get("data", [])
+            if (
+                not isinstance(result, dict)
+                or result.get("status") != 1
+                or result.get("errcode", 0) != 0
+                or not isinstance(page_items, list)
+            ):
+                return None
+            try:
+                current_total = int(data.get("total", len(page_items)))
+            except (TypeError, ValueError):
+                return None
+            if total is None:
+                total = current_total
+            elif current_total != total:
+                return None
+
+            raw_items.extend(item for item in page_items if isinstance(item, dict))
+            if len(raw_items) >= total:
+                break
+            if not page_items:
+                logger.warning("[KookMusic] 酷狗 song_v2 歌单分页提前返回空页")
+                return None
+
+        if total is None or len(raw_items) != total:
+            logger.warning(
+                f"[KookMusic] 酷狗 song_v2 歌单内容不完整: "
+                f"expected={total}, actual={len(raw_items)}"
+            )
+            return None
+        return raw_items
+
+    @classmethod
+    def _parse_kugou_playlist_songs(
+        cls,
+        items: list[dict],
+        requester_id: str,
+        requester_name: str,
+    ) -> list[Song]:
+        songs: list[Song] = []
+        for index, item in enumerate(items, start=1):
+            song_id = str(
+                item.get("hash", "") or item.get("FileHash", "")
+            ).upper()
+            if not re.fullmatch(r"[0-9A-F]{32}", song_id):
+                songs.append(
+                    cls._kugou_unavailable_placeholder(
+                        item, index, requester_id, requester_name
+                    )
+                )
+                continue
+
+            full_name = str(
+                item.get("filename", "")
+                or item.get("name", "")
+                or item.get("FileName", "")
+                or ""
+            )
+            name = str(
+                item.get("songname", "")
+                or item.get("SongName", "")
+                or ""
+            )
+            artists = str(
+                item.get("singername", "")
+                or item.get("SingerName", "")
+                or ""
+            )
+            if " - " in full_name:
+                inferred_artist, inferred_name = full_name.split(" - ", 1)
+                artists = artists or inferred_artist
+                name = name or inferred_name
+            name = name or str(item.get("remark", "") or "") or full_name or "未知歌曲"
+            artists = artists or "未知歌手"
+
+            trans_param = item.get("trans_param")
+            if not isinstance(trans_param, dict):
+                trans_param = {}
+            cover_url = str(
+                item.get("imgurl", "")
+                or item.get("Image", "")
+                or trans_param.get("union_cover", "")
+                or ""
+            ).replace("{size}", "400")
+            if cover_url.startswith("http://"):
+                cover_url = "https://" + cover_url[len("http://"):]
+
+            duration = cls._kugou_duration_ms(item)
+            songs.append(
+                Song(
+                    id=song_id,
+                    name=name,
+                    artists=artists,
+                    duration=duration,
+                    cover_url=cover_url,
+                    platform="kugou",
+                    requester_id=requester_id,
+                    requester_name=requester_name,
+                    extra_headers=dict(MusicSearcher.KUGOU_API_HEADERS),
+                    provider_data={
+                        "album_id": str(item.get("album_id", "") or ""),
+                        "audio_id": str(
+                            item.get("album_audio_id", "")
+                            or item.get("audio_id", "")
+                            or ""
+                        ),
+                    },
+                )
+            )
+        return songs
+
+    @classmethod
+    def _kugou_unavailable_placeholder(
+        cls,
+        item: dict,
+        index: int,
+        requester_id: str,
+        requester_name: str,
+    ) -> Song:
+        full_name = str(
+            item.get("filename", "")
+            or item.get("name", "")
+            or item.get("FileName", "")
+            or ""
+        )
+        artists = "未知歌手"
+        name = str(
+            item.get("songname", "")
+            or item.get("SongName", "")
+            or item.get("remark", "")
+            or ""
+        )
+        if " - " in full_name:
+            inferred_artist, inferred_name = full_name.split(" - ", 1)
+            artists = inferred_artist or artists
+            name = name or inferred_name
+        return Song(
+            id=f"unavailable-{index}",
+            name=name or full_name or "已下架歌曲",
+            artists=artists,
+            duration=cls._kugou_duration_ms(item),
+            platform="kugou",
+            requester_id=requester_id,
+            requester_name=requester_name,
+            extra_headers=dict(MusicSearcher.KUGOU_API_HEADERS),
+            unplayable_reason="酷狗音乐已下架或缺少可解析 FileHash",
+            provider_data={"resolver_status": "denied"},
+        )
+
+    @staticmethod
+    def _kugou_duration_ms(item: dict) -> int:
+        raw_ms = item.get("timelen", 0)
+        if raw_ms:
+            try:
+                return max(0, int(raw_ms))
+            except (TypeError, ValueError):
+                return 0
+        raw_seconds = item.get("duration", 0) or item.get("Duration", 0)
+        try:
+            return max(0, int(raw_seconds) * 1000)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _kugou_web_params(cls) -> dict:
+        clienttime = str(int(time.time() * 1000))
+        return {
+            "appid": cls.KUGOU_WEB_APP_ID,
+            "srcappid": cls.KUGOU_WEB_SOURCE_APP_ID,
+            "clientver": cls.KUGOU_WEB_CLIENT_VERSION,
+            "clienttime": clienttime,
+            "mid": cls.KUGOU_WEB_DEVICE_ID,
+            "uuid": cls.KUGOU_WEB_DEVICE_ID,
+            "dfid": "-",
+        }
+
+    @classmethod
+    def _kugou_web_headers(cls, params: dict) -> dict:
+        return {
+            **cls.KUGOU_PLAYLIST_WEB_HEADERS,
+            "mid": str(params["mid"]),
+            "clienttime": str(params["clienttime"]),
+            "dfid": str(params["dfid"]),
+        }
+
+    @classmethod
+    def _kugou_web_signature(cls, params: dict) -> str:
+        return cls._kugou_signature(
+            params, salt=cls.KUGOU_WEB_SIGNATURE_SALT
+        )
+
+    @classmethod
+    def _kugou_signature(
+        cls,
+        params: dict,
+        body: str = "",
+        salt: str | None = None,
+    ) -> str:
+        salt = salt or cls.KUGOU_SIGNATURE_SALT
+        params_string = "".join(
+            f"{key}={params[key]}" for key in sorted(params)
+        )
+        payload = salt + params_string + body + salt
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def parse_direct_song_input(text: str) -> tuple[str, str]:
