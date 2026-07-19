@@ -34,6 +34,9 @@ class GuildSession:
     is_playing: bool = False
     idle_seconds: int = 0
     needs_relay_refresh: bool = False
+    needs_direct_refresh: bool = False
+    pending_skips: int = 0
+    playback_retry_count: int = 0
 
     @property
     def current_song(self) -> Song | None:
@@ -58,6 +61,10 @@ class VoiceManager:
     PLAYBACK_TIMEOUT_BUFFER = 30
     # 未知时长歌曲的默认最大超时（秒）
     DEFAULT_MAX_TIMEOUT = 600
+    PLAYBACK_START_DELAY = 1.0
+    DIRECT_RECONNECT_DELAY = 0.5
+    PLAYBACK_RETRY_DELAY = 5.0
+    MAX_PLAYBACK_RETRIES = 3
 
     def __init__(
         self,
@@ -76,6 +83,9 @@ class VoiceManager:
         self.max_queue_size = max_queue_size
         self.sessions: dict[str, GuildSession] = {}
         self._playback_tasks: dict[str, asyncio.Task] = {}
+        self._retry_tasks: dict[str, asyncio.Task] = {}
+        self._guild_locks: dict[str, asyncio.Lock] = {}
+        self._session_creation_lock = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
         self.on_playback_finished: callable = None  # 回调：播放全部完成时调用
         self.on_song_started: callable = None  # 回调：新歌曲开始播放时调用 (guild_id, song)
@@ -127,82 +137,121 @@ class VoiceManager:
             消息以 "QUEUED:" 开头表示歌曲已入队等待播放，
             否则表示立即开始播放。
         """
-        # 检查是否已在该服务器
-        session = self.sessions.get(guild_id)
-        if session and not session.is_playing and not session.playlist:
-            logger.info("[KookMusic] 检测到空闲旧会话，重新建立语音会话")
-            await self._cleanup_session(guild_id)
-            session = None
-
-        if session:
-            # 检查队列长度限制
-            if len(session.playlist) >= self.max_queue_size:
-                return False, f"播放队列已满（最大 {self.max_queue_size} 首）"
-            session.idle_seconds = 0
-            # 已在频道中，添加歌曲到队列（不下载，等播放循环处理）
-            session.playlist.append(song)
-            pos = len(session.playlist)
-            if not session.is_playing:
-                # 播放循环已结束，启动新的
-                self._start_playback_loop(guild_id)
-                return True, f"开始播放：{song.display_name}"
-            return True, f"QUEUED:已添加到队列第 {pos} 位：{song.display_name}"
-
-        # 检查槽位
-        if len(self.sessions) >= self.max_sessions:
-            return False, f"播放槽位已满（最大 {self.max_sessions}）"
-
-        # 创建新会话
-        voice_client = VoiceClient(token)
-
-        # 确定实际使用的推流模式
-        # （已改用 UDP 替代 ZMQ，不再需要特殊 FFmpeg 编译支持）
-        effective_mode = self.streaming_mode
-
-        ffmpeg_player = create_player(
-            mode=effective_mode,
-            ffmpeg_path=self.ffmpeg_path,
-            volume=self.volume,
+        return await self.join_and_play_many(
+            token,
+            guild_id,
+            voice_channel_id,
+            text_channel_id,
+            [song],
         )
 
-        # 连接语音
-        connected = await voice_client.connect(voice_channel_id)
-        if not connected:
-            return False, "无法连接语音频道"
+    async def join_and_play_many(
+        self,
+        token: str,
+        guild_id: str,
+        voice_channel_id: str,
+        text_channel_id: str,
+        songs: list[Song],
+    ) -> tuple[bool, str]:
+        """原子地加入一批歌曲；容量不足时整批拒绝，不产生部分入队。"""
+        if not songs:
+            return False, "没有可加入的歌曲"
+        if len(songs) > self.max_queue_size:
+            return False, f"所选歌曲超过播放队列上限（最大 {self.max_queue_size} 首）"
 
-        session = GuildSession(
-            guild_id=guild_id,
-            voice_channel_id=voice_channel_id,
-            text_channel_id=text_channel_id,
-            voice_client=voice_client,
-            ffmpeg_player=ffmpeg_player,
-            playlist=[song],
-        )
-        self.sessions[guild_id] = session
+        lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            session = self.sessions.get(guild_id)
+            if session and not session.is_playing and not session.playlist:
+                logger.info("[KookMusic] 检测到空闲旧会话，重新建立语音会话")
+                await self._cleanup_session(guild_id)
+                session = None
 
-        # relay 模式：启动常驻中继进程
-        if isinstance(ffmpeg_player, RelayFFmpegPlayer):
-            relay_ok = await ffmpeg_player.start_relay(
-                voice_client.rtp_url, voice_client.ssrc
-            )
-            if not relay_ok:
-                logger.error("[KookMusic] UDP 中继启动失败，回退到 direct 模式")
-                # 回退到 direct 模式
-                ffmpeg_player = DirectFFmpegPlayer(
-                    ffmpeg_path=self.ffmpeg_path, volume=self.volume
+            if session:
+                available = self.max_queue_size - len(session.playlist)
+                if len(songs) > available:
+                    return False, f"播放队列容量不足，目前最多还能加入 {available} 首"
+                start_pos = len(session.playlist) + 1
+                session.playlist.extend(songs)
+                session.idle_seconds = 0
+                if not session.is_playing:
+                    self._start_playback_loop(guild_id)
+                    return True, f"开始播放，共加入 {len(songs)} 首"
+                if len(songs) == 1:
+                    return True, (
+                        f"QUEUED:已添加到队列第 {start_pos} 位："
+                        f"{songs[0].display_name}"
+                    )
+                return True, (
+                    f"QUEUED:已添加 {len(songs)} 首到队列第 "
+                    f"{start_pos}-{start_pos + len(songs) - 1} 位"
                 )
-                session.ffmpeg_player = ffmpeg_player
 
-        # 启动播放循环
-        self._start_playback_loop(guild_id)
+            return await self._create_session_with_songs(
+                token,
+                guild_id,
+                voice_channel_id,
+                text_channel_id,
+                songs,
+            )
 
-        # 启动空闲检查循环（如果尚未启动）
-        self._ensure_idle_check()
+    async def _create_session_with_songs(
+        self,
+        token: str,
+        guild_id: str,
+        voice_channel_id: str,
+        text_channel_id: str,
+        songs: list[Song],
+    ) -> tuple[bool, str]:
+        """串行创建新会话，并在初始化完全成功后才对外发布。"""
+        async with self._session_creation_lock:
+            if len(self.sessions) >= self.max_sessions:
+                return False, f"播放槽位已满（最大 {self.max_sessions}）"
 
-        return True, "已加入语音频道，开始播放"
+            voice_client = VoiceClient(token)
+            ffmpeg_player = create_player(
+                mode=self.streaming_mode,
+                ffmpeg_path=self.ffmpeg_path,
+                volume=self.volume,
+            )
+            connected = await voice_client.connect(voice_channel_id)
+            if not connected:
+                return False, "无法连接语音频道"
+
+            session = GuildSession(
+                guild_id=guild_id,
+                voice_channel_id=voice_channel_id,
+                text_channel_id=text_channel_id,
+                voice_client=voice_client,
+                ffmpeg_player=ffmpeg_player,
+                playlist=list(songs),
+            )
+
+            if isinstance(ffmpeg_player, RelayFFmpegPlayer):
+                relay_ok = await ffmpeg_player.start_relay(
+                    voice_client.rtp_url, voice_client.ssrc
+                )
+                if not relay_ok:
+                    logger.error("[KookMusic] UDP 中继启动失败，回退到 direct 模式")
+                    ffmpeg_player = DirectFFmpegPlayer(
+                        ffmpeg_path=self.ffmpeg_path, volume=self.volume
+                    )
+                    session.ffmpeg_player = ffmpeg_player
+
+            self.sessions[guild_id] = session
+            self._start_playback_loop(guild_id)
+            self._ensure_idle_check()
+            return True, f"已加入语音频道，开始播放，共加入 {len(songs)} 首"
 
     def _start_playback_loop(self, guild_id: str):
         """启动或重启播放循环"""
+        retry_task = self._retry_tasks.pop(guild_id, None)
+        if (
+            retry_task
+            and retry_task is not asyncio.current_task()
+            and not retry_task.done()
+        ):
+            retry_task.cancel()
         # 取消旧任务（如果存在且未完成）
         old_task = self._playback_tasks.get(guild_id)
         if old_task and not old_task.done():
@@ -219,6 +268,9 @@ class VoiceManager:
             return False, f"播放队列已满（最大 {self.max_queue_size} 首）"
         session.playlist.append(song)
         pos = len(session.playlist)
+        session.idle_seconds = 0
+        if not session.is_playing:
+            self._start_playback_loop(guild_id)
         return True, f"已添加到队列第 {pos} 位"
 
     async def skip(self, guild_id: str) -> tuple[bool, str]:
@@ -228,8 +280,13 @@ class VoiceManager:
             return False, "Bot 不在语音频道中"
         if not session.playlist:
             return False, "播放队列为空"
+        if session.pending_skips >= len(session.playlist):
+            return False, "没有更多可跳过的歌曲"
+        session.pending_skips += 1
+        if not session.is_playing:
+            self._start_playback_loop(guild_id)
         await session.ffmpeg_player.stop()
-        return True, "已切换下一首"
+        return True, "已跳过一首歌曲"
 
     async def move_to_next(self, guild_id: str, position: int) -> tuple[bool, str]:
         """将播放队列中的指定序号移动到下一首播放。
@@ -259,8 +316,12 @@ class VoiceManager:
             return False, "Bot 不在语音频道中"
         if len(session.playlist) > 1:
             current = session.playlist[0]
+            removed = session.playlist[1:]
             session.playlist.clear()
             session.playlist.append(current)
+            for song in removed:
+                self._cleanup_song_file(song)
+        session.pending_skips = min(session.pending_skips, len(session.playlist))
         return True, "已清空队列"
 
     async def toggle_loop(self, guild_id: str) -> tuple[bool, str]:
@@ -273,17 +334,26 @@ class VoiceManager:
 
     async def leave(self, guild_id: str) -> tuple[bool, str]:
         """退出语音频道"""
-        session = self.sessions.get(guild_id)
-        if not session:
-            return False, "Bot 不在语音频道中"
-        await self._cleanup_session(guild_id)
-        return True, "已退出语音频道"
+        lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            session = self.sessions.get(guild_id)
+            if not session:
+                return False, "Bot 不在语音频道中"
+            await self._cleanup_session(guild_id)
+            return True, "已退出语音频道"
 
     async def leave_all(self):
         """退出所有语音频道（插件卸载时调用）"""
         guild_ids = list(self.sessions.keys())
         for gid in guild_ids:
-            await self._cleanup_session(gid)
+            await self.leave(gid)
+        if self._idle_task and not self._idle_task.done():
+            self._idle_task.cancel()
+            try:
+                await self._idle_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._idle_task = None
 
     def get_playlist_text(self, guild_id: str) -> str:
         """获取播放队列文本"""
@@ -425,6 +495,7 @@ class VoiceManager:
 
         player = session.ffmpeg_player
         is_relay = isinstance(player, RelayFFmpegPlayer)
+        retry_needed = False
 
         session.is_playing = True
         try:
@@ -433,6 +504,12 @@ class VoiceManager:
                 session = self.sessions.get(guild_id)
                 if not session or not session.playlist:
                     break
+
+                # 连续点击切歌时，每次点击都对应丢弃一首。尚未开始下载/播放的
+                # 歌曲直接跳过，避免多个快速点击最终只生效一次。
+                if session.pending_skips > 0:
+                    self._consume_pending_skip(session)
+                    continue
 
                 song = session.playlist[0]
 
@@ -446,6 +523,13 @@ class VoiceManager:
                             if guild_id not in self.sessions:
                                 break
                             session = self.sessions[guild_id]
+                            if session.pending_skips > 0:
+                                if updated_song and updated_song.file_path:
+                                    song = updated_song
+                                    if session.playlist and session.playlist[0] is not song:
+                                        session.playlist[0] = song
+                                self._consume_pending_skip(session)
+                                continue
                             # 更新队列中的歌曲对象
                             if updated_song and updated_song.file_path:
                                 if session.playlist and session.playlist[0] is song:
@@ -453,29 +537,54 @@ class VoiceManager:
                                     song = updated_song
                             else:
                                 logger.error(f"[KookMusic] 下载失败: {song.name}")
-                                if session.playlist:
-                                    session.playlist.pop(0)
+                                self._drop_failed_current(session, song)
                                 continue
                         except Exception as e:
                             logger.error(f"[KookMusic] 下载异常: {song.name}: {e}")
-                            if guild_id in self.sessions and self.sessions[guild_id].playlist:
-                                self.sessions[guild_id].playlist.pop(0)
+                            if guild_id in self.sessions:
+                                self._drop_failed_current(self.sessions[guild_id], song)
                             continue
                     else:
                         logger.warning(f"[KookMusic] 歌曲无本地文件且无下载回调: {song.name}")
-                        session.playlist.pop(0)
+                        self._drop_failed_current(session, song)
                         continue
+
+                if not is_relay and session.needs_direct_refresh:
+                    logger.info("[KookMusic] Direct 模式: 重连语音频道获取新 RTP...")
+                    await session.voice_client.disconnect()
+                    await asyncio.sleep(self.DIRECT_RECONNECT_DELAY)
+                    reconnected = await session.voice_client.connect(
+                        session.voice_channel_id
+                    )
+                    if not reconnected:
+                        logger.error("[KookMusic] 语音重连失败，停止播放")
+                        retry_needed = True
+                        break
+                    session.needs_direct_refresh = False
+                    logger.info(
+                        f"[KookMusic] RTP 已更新: "
+                        f"{session.voice_client.rtp_url}, "
+                        f"SSRC: {session.voice_client.ssrc}"
+                    )
 
                 # 确保语音连接存活（每首歌播放前都检查）
                 if not await self._ensure_voice_alive(session):
                     logger.error("[KookMusic] 语音连接不可用，停止播放")
+                    retry_needed = True
                     break
                 if is_relay and not await self._prepare_relay_for_playback(session):
                     logger.error("[KookMusic] 中继恢复失败，停止播放")
+                    retry_needed = True
                     break
+                if session.pending_skips > 0:
+                    self._consume_pending_skip(session)
+                    continue
 
                 logger.info(f"[KookMusic] 开始播放: {song.display_name}")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(self.PLAYBACK_START_DELAY)
+                if session.pending_skips > 0:
+                    self._consume_pending_skip(session)
+                    continue
 
                 if is_relay:
                     # ---- relay 模式：直接播放，不需要 RTP 参数 ----
@@ -487,12 +596,16 @@ class VoiceManager:
                         session.voice_client.rtp_url,
                         session.voice_client.ssrc,
                     )
+                    # Direct 的 Transport 在一次播放尝试后即视为已使用；即使
+                    # 启动阶段被切歌终止，下一首也必须刷新 RTP，避免无声。
+                    session.needs_direct_refresh = True
 
                 if not ok:
                     logger.error(f"[KookMusic] 播放失败: {song.name}")
-                    if guild_id in self.sessions and self.sessions[guild_id].playlist:
-                        self.sessions[guild_id].playlist.pop(0)
+                    if guild_id in self.sessions:
+                        self._drop_failed_current(self.sessions[guild_id], song)
                     continue
+                session.playback_retry_count = 0
 
                 # 通知外部：新歌曲开始播放（用于发送卡片消息）
                 if self.on_song_started:
@@ -526,29 +639,13 @@ class VoiceManager:
                 if guild_id not in self.sessions:
                     break
                 session = self.sessions[guild_id]
-
-                # ---- direct 模式：完整重连语音频道（获取新的 RTP 参数） ----
-                if not is_relay and session.playlist and guild_id in self.sessions:
-                    logger.info("[KookMusic] Direct 模式: 重连语音频道获取新 RTP...")
-                    await session.voice_client.disconnect()
-                    await asyncio.sleep(0.5)
-                    reconnected = await session.voice_client.connect(
-                        session.voice_channel_id
-                    )
-                    if not reconnected:
-                        logger.error("[KookMusic] 语音重连失败，停止播放")
-                        break
-                    logger.info(
-                        f"[KookMusic] RTP 已更新: "
-                        f"{session.voice_client.rtp_url}, "
-                        f"SSRC: {session.voice_client.ssrc}"
-                    )
-
                 # 处理循环模式
                 if guild_id not in self.sessions:
                     break
                 session = self.sessions[guild_id]
-                if session.loop_mode == 0:
+                if session.pending_skips > 0:
+                    self._consume_pending_skip(session)
+                elif session.loop_mode == 0:
                     finished_song = session.playlist.pop(0)
                     # 清理已播放完毕的歌曲缓存文件
                     self._cleanup_song_file(finished_song)
@@ -568,6 +665,7 @@ class VoiceManager:
             logger.info(f"[KookMusic] 播放循环被取消: {guild_id}")
         except Exception as e:
             logger.error(f"[KookMusic] 播放循环异常: {e}")
+            retry_needed = True
         finally:
             # 确保当前歌曲已停止（不停中继进程，由 _cleanup_session 处理）
             try:
@@ -579,6 +677,23 @@ class VoiceManager:
             current_session = self.sessions.get(guild_id)
             if current_session is session:
                 current_session.is_playing = False
+            if (
+                retry_needed
+                and current_session is session
+                and current_session.playlist
+            ):
+                if current_session.playback_retry_count < self.MAX_PLAYBACK_RETRIES:
+                    current_session.playback_retry_count += 1
+                    self._schedule_playback_retry(guild_id, current_session)
+                else:
+                    logger.error(
+                        f"[KookMusic] 连续 {self.MAX_PLAYBACK_RETRIES} 次恢复播放失败，"
+                        "清空队列并结束会话"
+                    )
+                    for queued_song in current_session.playlist:
+                        self._cleanup_song_file(queued_song)
+                    current_session.playlist.clear()
+                    current_session.pending_skips = 0
             # 播放队列为空时通知外部（但不自动退出，空闲检查循环会处理退出）
             current_session = self.sessions.get(guild_id)
             queue_empty = current_session is not None and not current_session.playlist
@@ -596,6 +711,52 @@ class VoiceManager:
                 except Exception as e:
                     logger.debug(f"[KookMusic] 播放完成回调异常: {e}")
 
+    def _schedule_playback_retry(
+        self, guild_id: str, expected_session: GuildSession
+    ):
+        old_task = self._retry_tasks.pop(guild_id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        async def retry_later():
+            try:
+                delay = self.PLAYBACK_RETRY_DELAY * max(
+                    1, expected_session.playback_retry_count
+                )
+                await asyncio.sleep(delay)
+                current = self.sessions.get(guild_id)
+                if (
+                    current is expected_session
+                    and current.playlist
+                    and not current.is_playing
+                ):
+                    self._start_playback_loop(guild_id)
+            except asyncio.CancelledError:
+                pass
+
+        self._retry_tasks[guild_id] = asyncio.create_task(retry_later())
+
+    def _consume_pending_skip(self, session: GuildSession) -> bool:
+        """消费一次排队的切歌请求，并删除对应队首歌曲。"""
+        if session.pending_skips <= 0 or not session.playlist:
+            return False
+        skipped_song = session.playlist.pop(0)
+        session.pending_skips -= 1
+        session.idle_seconds = 0
+        self._cleanup_song_file(skipped_song)
+        return True
+
+    def _drop_failed_current(self, session: GuildSession, song: Song) -> bool:
+        """移除失败的队首；若切歌请求正等待，则同时只消费这一次请求。"""
+        if not session.playlist or session.playlist[0] is not song:
+            return False
+        if session.pending_skips > 0:
+            return self._consume_pending_skip(session)
+        failed_song = session.playlist.pop(0)
+        self._cleanup_song_file(failed_song)
+        session.idle_seconds = 0
+        return True
+
     @staticmethod
     def _cleanup_song_file(song: Song):
         """清理单首歌曲的缓存文件"""
@@ -609,6 +770,13 @@ class VoiceManager:
 
     async def _cleanup_session(self, guild_id: str):
         """清理会话"""
+        retry_task = self._retry_tasks.pop(guild_id, None)
+        if retry_task and not retry_task.done():
+            retry_task.cancel()
+            try:
+                await retry_task
+            except (asyncio.CancelledError, Exception):
+                pass
         # 先取消播放任务
         task = self._playback_tasks.pop(guild_id, None)
         if task and not task.done():

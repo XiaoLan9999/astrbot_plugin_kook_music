@@ -1,6 +1,6 @@
 import unittest
 
-from playlist_range import validate_playlist_range
+from playlist_range import looks_like_playlist_range, validate_playlist_range
 
 
 class PlaylistRangeValidationTests(unittest.TestCase):
@@ -30,6 +30,17 @@ class PlaylistRangeValidationTests(unittest.TestCase):
         result, error = validate_playlist_range("200", 1267, 200)
         self.assertIsNone(result)
         self.assertIn("格式错误", error)
+
+    def test_rejects_extremely_long_numbers_without_raising(self):
+        result, error = validate_playlist_range(f"{'9' * 5000}-10", 1267, 200)
+        self.assertIsNone(result)
+        self.assertIn("格式错误", error)
+
+    def test_only_numeric_replies_are_treated_as_range_attempts(self):
+        self.assertTrue(looks_like_playlist_range("1-200"))
+        self.assertTrue(looks_like_playlist_range("200"))
+        self.assertFalse(looks_like_playlist_range("#下一首"))
+        self.assertFalse(looks_like_playlist_range("普通聊天"))
 
 
 if __name__ == "__main__":

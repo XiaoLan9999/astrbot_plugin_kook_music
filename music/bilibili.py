@@ -176,10 +176,11 @@ class BilibiliExtractor:
         cache_dir.mkdir(parents=True, exist_ok=True)
         output_base = str(cache_dir / uuid.uuid4().hex)
 
+        download_task = asyncio.create_task(
+            asyncio.to_thread(self._yt_download_audio, url, output_base)
+        )
         try:
-            result_path = await asyncio.to_thread(
-                self._yt_download_audio, url, output_base
-            )
+            result_path = await asyncio.shield(download_task)
             if result_path and Path(result_path).exists():
                 song.file_path = result_path
                 logger.info(
@@ -188,10 +189,34 @@ class BilibiliExtractor:
                 )
             else:
                 logger.error(f"[KookMusic] B站音频下载失败: 文件不存在")
+        except asyncio.CancelledError:
+            # to_thread 无法强制停止；让后台下载完成后删除这一批无人引用的文件。
+            download_task.add_done_callback(
+                lambda task: self._finish_cancelled_download(task, output_base)
+            )
+            raise
         except Exception as e:
+            self._cleanup_cancelled_download(output_base)
             logger.error(f"[KookMusic] yt-dlp 下载失败: {e}")
 
         return song
+
+    @staticmethod
+    def _cleanup_cancelled_download(output_base: str):
+        base = Path(output_base)
+        for path in base.parent.glob(f"{base.name}.*"):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @classmethod
+    def _finish_cancelled_download(cls, task: asyncio.Task, output_base: str):
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+        cls._cleanup_cancelled_download(output_base)
 
     def _yt_download_audio(self, url: str, output_base: str) -> str:
         """同步调用 yt-dlp 下载音频"""

@@ -1,7 +1,13 @@
 import re
 
 
-_RANGE_PATTERN = re.compile(r"^(\d+)\s*(?:-|~|～|—|至)\s*(\d+)$")
+_RANGE_PATTERN = re.compile(r"^(\d{1,12})\s*(?:-|~|～|—|至)\s*(\d{1,12})$")
+_RANGE_PREFIX_PATTERN = re.compile(r"^\d")
+
+
+def looks_like_playlist_range(text: str) -> bool:
+    """只把数字开头的回复视为区间输入，避免吞掉聊天和其他命令。"""
+    return bool(_RANGE_PREFIX_PATTERN.match(text.strip()))
 
 
 def validate_playlist_range(

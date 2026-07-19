@@ -277,14 +277,28 @@ def build_queue_card(
             "text": {"type": "kmarkdown", "content": "队列为空"}
         })
     else:
+        # KOOK 单条卡片最多 50 个模块。大型队列仅展示前 100 首，
+        # 保证卡片稳定可发送；完整数量仍在底部显示。
+        visible_playlist = playlist[:100]
         lines = []
-        for i, song in enumerate(playlist):
+        for i, song in enumerate(visible_playlist):
             prefix = "▶" if i == 0 else f"{i + 1}"
             lines.append(f"**{prefix}.** {song.display_name}")
         for start in range(0, len(lines), 10):
             modules.append({
                 "type": "section",
                 "text": {"type": "kmarkdown", "content": "\n".join(lines[start:start + 10])}
+            })
+        if len(playlist) > len(visible_playlist):
+            modules.append({
+                "type": "section",
+                "text": {
+                    "type": "kmarkdown",
+                    "content": (
+                        f"_队列较长，仅展示前 {len(visible_playlist)} 首；"
+                        f"其余 {len(playlist) - len(visible_playlist)} 首仍会正常播放。_"
+                    ),
+                },
             })
 
     modules.append({"type": "divider"})

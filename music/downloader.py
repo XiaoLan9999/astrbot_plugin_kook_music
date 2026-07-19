@@ -95,6 +95,10 @@ class MusicDownloader:
             logger.info(f"[KookMusic] 下载完成: {song.name} -> {file_path.name}")
             return song
 
+        except asyncio.CancelledError:
+            if file_path.exists():
+                file_path.unlink(missing_ok=True)
+            raise
         except Exception as e:
             logger.error(f"[KookMusic] 下载异常 '{song.name}': {e}")
             # 清理未完成的文件

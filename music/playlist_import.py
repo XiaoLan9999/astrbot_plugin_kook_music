@@ -47,6 +47,9 @@ class PlaylistImporter:
 
     # 免登录歌单 API（meting API）
     NETEASE_PLAYLIST_API = "https://api.qijieya.cn/meting/?type=playlist&id={playlist_id}"
+    NETEASE_PLAYLIST_DETAIL_API = (
+        "https://music.163.com/api/v6/playlist/detail?id={playlist_id}&n=100000&s=8"
+    )
     NETEASE_SONG_API = "https://api.qijieya.cn/meting/?type=song&id={song_id}"
     NETEASE_SONG_DETAIL_API = "https://music.163.com/api/song/detail/?id={song_id}&ids=[{song_ids}]"
 
@@ -173,6 +176,7 @@ class PlaylistImporter:
         playlist_id: str,
         requester_id: str = "",
         requester_name: str = "",
+        fill_durations: bool = True,
     ) -> list[Song]:
         """通过免登录 API 获取网易云歌单中的所有歌曲。
 
@@ -196,13 +200,23 @@ class PlaylistImporter:
                     logger.warning(
                         f"[KookMusic] 获取歌单失败: HTTP {resp.status}"
                     )
-                    return []
+                    track_ids = await self._fetch_playlist_track_ids(
+                        session, playlist_id
+                    )
+                    return self._merge_playlist_order(
+                        track_ids, [], requester_id, requester_name
+                    ) if track_ids else []
 
                 data = await resp.json(content_type=None)
 
                 if not isinstance(data, list):
                     logger.warning("[KookMusic] 歌单 API 返回格式异常")
-                    return []
+                    track_ids = await self._fetch_playlist_track_ids(
+                        session, playlist_id
+                    )
+                    return self._merge_playlist_order(
+                        track_ids, [], requester_id, requester_name
+                    ) if track_ids else []
 
                 songs: list[Song] = []
                 for item in data:
@@ -220,7 +234,22 @@ class PlaylistImporter:
                     )
                     songs.append(song)
 
-                await self._fill_netease_song_durations(session, songs)
+                # meting 偶尔可能只返回部分歌曲。用网易云官方详情中的
+                # trackIds 校验总数并恢复完整顺序；缺失项先放轻量占位，
+                # 用户选定区间后再批量补元数据。
+                track_ids = await self._fetch_playlist_track_ids(
+                    session, playlist_id
+                )
+                if track_ids:
+                    songs = self._merge_playlist_order(
+                        track_ids,
+                        songs,
+                        requester_id,
+                        requester_name,
+                    )
+
+                if fill_durations:
+                    await self._fill_netease_song_durations(session, songs)
 
                 logger.info(
                     f"[KookMusic] 歌单 {playlist_id} 导入成功: {len(songs)} 首歌曲"
@@ -230,6 +259,154 @@ class PlaylistImporter:
         except Exception as e:
             logger.error(f"[KookMusic] 导入歌单异常: {e}")
             return []
+
+    async def fill_netease_song_durations(self, songs: list[Song]):
+        """仅为最终选中的歌曲补全时长，避免大型歌单选择前发起大量请求。"""
+        if not songs:
+            return
+        session = await self._get_session()
+        await self._fill_netease_song_durations(session, songs)
+
+    async def enrich_netease_songs(self, songs: list[Song]):
+        """批量补全最终选中歌曲的名称、歌手、封面和时长。"""
+        need_details = [
+            song
+            for song in songs
+            if song.id
+            and (
+                song.duration <= 0
+                or not song.name
+                or song.name == "未知歌曲"
+                or not song.artists
+                or song.artists == "未知歌手"
+            )
+        ]
+        if not need_details:
+            return
+
+        session = await self._get_session()
+        by_id = {song.id: song for song in need_details}
+        for start in range(0, len(need_details), 50):
+            batch = need_details[start:start + 50]
+            details = await self._fetch_song_details(
+                session, [song.id for song in batch]
+            )
+            for detail in details:
+                song_id = str(detail.get("id", ""))
+                song = by_id.get(song_id)
+                if not song:
+                    continue
+                name = detail.get("name", "")
+                artists_data = detail.get("artists") or detail.get("ar") or []
+                artists = "、".join(
+                    artist.get("name", "")
+                    for artist in artists_data
+                    if artist.get("name")
+                )
+                album = detail.get("album") or detail.get("al") or {}
+                if name:
+                    song.name = name
+                if artists:
+                    song.artists = artists
+                if not song.cover_url:
+                    song.cover_url = album.get("picUrl", "")
+                duration = self._extract_duration_from_detail(detail)
+                if duration > 0:
+                    song.duration = duration
+
+    async def _fetch_playlist_track_ids(
+        self,
+        session: aiohttp.ClientSession,
+        playlist_id: str,
+    ) -> list[str]:
+        """读取官方 trackIds，并仅在数量完整时用于校验第三方列表。"""
+        url = self.NETEASE_PLAYLIST_DETAIL_API.format(playlist_id=playlist_id)
+        try:
+            async with session.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://music.163.com/",
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.debug(f"[KookMusic] 校验歌单完整性失败: {e}")
+            return []
+
+        playlist = data.get("playlist", {}) if isinstance(data, dict) else {}
+        raw_ids = playlist.get("trackIds", [])
+        track_ids = [
+            str(item.get("id", ""))
+            for item in raw_ids
+            if isinstance(item, dict) and item.get("id")
+        ]
+        try:
+            track_count = int(playlist.get("trackCount", len(track_ids)))
+        except (TypeError, ValueError):
+            track_count = len(track_ids)
+        if not track_ids or len(track_ids) != track_count:
+            logger.warning(
+                f"[KookMusic] 官方歌单曲目列表不完整: "
+                f"trackIds={len(track_ids)}, trackCount={track_count}"
+            )
+            return []
+        return track_ids
+
+    @staticmethod
+    def _merge_playlist_order(
+        track_ids: list[str],
+        songs: list[Song],
+        requester_id: str,
+        requester_name: str,
+    ) -> list[Song]:
+        """按官方顺序合并 meting 数据，并为被截断的条目建立占位。"""
+        songs_by_id = {song.id: song for song in songs if song.id}
+        merged = []
+        for song_id in track_ids:
+            song = songs_by_id.get(song_id)
+            if song is None:
+                song = Song(
+                    id=song_id,
+                    name="未知歌曲",
+                    artists="未知歌手",
+                    platform="netease",
+                    requester_id=requester_id,
+                    requester_name=requester_name,
+                )
+            merged.append(song)
+        return merged
+
+    async def _fetch_song_details(
+        self,
+        session: aiohttp.ClientSession,
+        song_ids: list[str],
+    ) -> list[dict]:
+        if not song_ids:
+            return []
+        url = self.NETEASE_SONG_DETAIL_API.format(
+            song_id=song_ids[0],
+            song_ids=",".join(song_ids),
+        )
+        try:
+            async with session.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://music.163.com/",
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.debug(f"[KookMusic] 批量获取歌曲详情异常: {e}")
+            return []
+        return data.get("songs", []) if isinstance(data, dict) else []
 
     @staticmethod
     def _normalize_duration(duration) -> int:
