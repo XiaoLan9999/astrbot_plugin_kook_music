@@ -27,10 +27,15 @@ from .music.model import Song
 from .music.searcher import MusicSearcher
 from .music.bilibili import BilibiliExtractor
 from .music.playlist_import import PlaylistImporter
+from .playlist_range import validate_playlist_range
 
 # 用户选歌等待映射：session_key -> (songs, future, [msg_ids_to_delete])
 _pending_selections: dict[str, tuple[list[Song], asyncio.Future, list[str]]] = {}
 _pending_selections_lock = asyncio.Lock()
+
+# 大型歌单区间选择：session_key -> (完整歌单, 等待区间结果的 future)
+_pending_playlist_ranges: dict[str, tuple[list[Song], asyncio.Future]] = {}
+_pending_playlist_ranges_lock = asyncio.Lock()
 
 # 已知的平台标识
 _KNOWN_PLATFORMS = {"netease", "qq", "kugou", "kuwo", "migu", "baidu", "bilibili"}
@@ -58,6 +63,9 @@ class KookMusicPlugin(Star):
         # 配置项
         self.default_platform = self.config.get("default_platform", "netease")
         self.max_queue_size = self.config.get("max_queue_size", 50)
+        self.playlist_range_timeout = max(
+            10, int(self.config.get("playlist_range_timeout", 60))
+        )
         self.search_limit = self.config.get("search_limit", 5)
         self.auto_leave_timeout = self.config.get("auto_leave_timeout", 300)
         self.max_sessions = self.config.get("max_sessions", 5)
@@ -98,10 +106,11 @@ class KookMusicPlugin(Star):
 
     async def initialize(self):
         """插件初始化"""
-        global _button_click_queue, _pending_selections
+        global _button_click_queue, _pending_selections, _pending_playlist_ranges
         _button_click_queue = asyncio.Queue()
         # 重置全局状态（支持热重载）
         _pending_selections.clear()
+        _pending_playlist_ranges.clear()
 
         self._kook_token = self._find_kook_token()
         if self._kook_token:
@@ -507,13 +516,20 @@ class KookMusicPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """处理用户选歌回复"""
+        """处理搜索选歌和大型歌单区间回复。"""
         if not self._is_kook(event):
             return
 
         text = event.message_str.strip()
         guild_id = self._get_guild_id(event)
         session_key = f"{event.get_sender_id()}_{guild_id}"
+
+        if session_key in _pending_playlist_ranges:
+            async for result in self._handle_playlist_range_reply(
+                event, session_key, guild_id, text
+            ):
+                yield result
+            return
 
         if session_key not in _pending_selections:
             return
@@ -671,7 +687,7 @@ class KookMusicPlugin(Star):
                 return
 
         raw_text = event.message_str.strip()
-        for prefix in ("导入歌单", "/导入歌单"):
+        for prefix in ("导入歌单", "/导入歌单", "#导入歌单"):
             if raw_text.startswith(prefix):
                 raw_text = raw_text[len(prefix):].strip()
                 break
@@ -718,6 +734,56 @@ class KookMusicPlugin(Star):
 
         if not songs:
             yield event.plain_result(f"❌ {type_label} {target_id} 导入失败或内容为空")
+            return
+
+        available_slots = self._available_queue_slots(guild_id)
+        if available_slots <= 0:
+            yield event.plain_result(
+                f"❌ 当前播放队列已满（上限 {self.max_queue_size} 首），无法导入歌单"
+            )
+            return
+
+        if len(songs) > available_slots:
+            session_key = f"{requester_id}_{guild_id}"
+            future = asyncio.get_running_loop().create_future()
+            async with _pending_playlist_ranges_lock:
+                old_entry = _pending_playlist_ranges.pop(session_key, None)
+                if old_entry and not old_entry[1].done():
+                    old_entry[1].cancel()
+                _pending_playlist_ranges[session_key] = (songs, future)
+
+            await event.send(event.plain_result(
+                f"📚 {type_label}共有 {len(songs)} 首，当前队列最多还能加入 "
+                f"{available_slots} 首。\n"
+                f"请在 {self.playlist_range_timeout} 秒内输入要播放的歌曲区间，"
+                f"例如 `1-{available_slots}`。\n"
+                f"区间必须在 1-{len(songs)} 内，且歌曲数量不能超过 "
+                f"{available_slots} 首。"
+            ))
+
+            try:
+                songs = await asyncio.wait_for(
+                    future, timeout=self.playlist_range_timeout
+                )
+            except asyncio.TimeoutError:
+                yield event.plain_result("⏰ 歌单区间选择超时，本次导入已取消")
+                return
+            except asyncio.CancelledError:
+                yield event.plain_result("ℹ️ 已由新的歌单导入请求替换本次区间选择")
+                return
+            finally:
+                async with _pending_playlist_ranges_lock:
+                    current = _pending_playlist_ranges.get(session_key)
+                    if current and current[1] is future:
+                        _pending_playlist_ranges.pop(session_key, None)
+
+        # 区间确认后再次按实时队列检查，避免等待期间其他用户把队列填满。
+        available_slots = self._available_queue_slots(guild_id)
+        if len(songs) > available_slots:
+            yield event.plain_result(
+                f"❌ 等待期间队列发生变化，目前只能再加入 {available_slots} 首。"
+                "请重新执行导入歌单并选择更短的区间。"
+            )
             return
 
         # 确保 Bot 在语音频道中
@@ -784,6 +850,45 @@ class KookMusicPlugin(Star):
             yield event.chain_result([Json(data=result_card)])
 
     # ========== 内部方法 ==========
+
+    def _available_queue_slots(self, guild_id: str) -> int:
+        """返回服务器播放队列按当前配置仍可加入的歌曲数。"""
+        session = self.voice_manager.get_session(guild_id)
+        used = len(session.playlist) if session else 0
+        return max(0, self.max_queue_size - used)
+
+    async def _handle_playlist_range_reply(
+        self,
+        event: AstrMessageEvent,
+        session_key: str,
+        guild_id: str,
+        text: str,
+    ):
+        """校验大型歌单的 1-based 闭区间；错误输入不会结束等待。"""
+        async with _pending_playlist_ranges_lock:
+            entry = _pending_playlist_ranges.get(session_key)
+            if not entry:
+                return
+            songs, future = entry
+
+            available_slots = self._available_queue_slots(guild_id)
+            selected_range, error = validate_playlist_range(
+                text, len(songs), available_slots
+            )
+            if error:
+                yield event.plain_result(f"❌ {error}")
+                return
+
+            start, end = selected_range
+
+            _pending_playlist_ranges.pop(session_key, None)
+            if not future.done():
+                future.set_result(songs[start - 1:end])
+
+        user_msg_id = event.message_obj.message_id
+        if user_msg_id and self._kook_token:
+            asyncio.create_task(delete_message(self._kook_token, user_msg_id))
+        event.stop_event()
 
     async def _send_card(self, channel_id: str, guild_id: str, card_data: dict) -> str | None:
         """发送卡片并记录 msg_id（先删旧卡片再发新卡片）"""

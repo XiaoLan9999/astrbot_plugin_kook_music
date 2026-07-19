@@ -29,10 +29,21 @@
         "type": "int",
         "slider": {
             "min": 10,
-            "max": 200,
+            "max": 2000,
             "step": 10
         },
         "default": 50
+    },
+    "playlist_range_timeout": {
+        "description": "大型歌单区间选择超时(秒)",
+        "hint": "歌单歌曲数超过当前队列可用容量时，等待用户输入歌曲区间的最长时间。",
+        "type": "int",
+        "slider": {
+            "min": 10,
+            "max": 300,
+            "step": 10
+        },
+        "default": 60
     },
     "max_sessions": {
         "description": "最大同时语音数",
