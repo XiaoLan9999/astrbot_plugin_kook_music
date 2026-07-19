@@ -1,6 +1,6 @@
 name: astrbot_plugin_kook_music
 display_name: KOOK语音点歌
 desc: KOOK平台语音频道点歌插件，支持多平台免登录搜索、B站视频点歌、多平台歌单导入、自动加入语音频道、FFmpeg实时推流播放
-version: v1.5.0
+version: v1.5.1
 author: XiaoLan9999
 repo: "https://github.com/XiaoLan9999/astrbot_plugin_kook_music"

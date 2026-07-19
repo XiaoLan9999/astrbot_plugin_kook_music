@@ -13,9 +13,11 @@ from astrbot_plugin_kook_music.music.playlist_import import PlaylistImporter
 
 
 class FakeResponse:
-    def __init__(self, data=None, status=200):
+    def __init__(self, data=None, status=200, headers=None, url="https://example.test/"):
         self.data = data
         self.status = status
+        self.headers = headers or {}
+        self.url = url
 
     async def __aenter__(self):
         return self
@@ -166,6 +168,39 @@ class PlaylistInputParsingTests(unittest.TestCase):
 
 
 class QQPlaylistImportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_official_qq_short_link_redirect_resolves_playlist_id(self):
+        short_url = "https://c6.y.qq.com/base/fcgi-bin/u?__=token"
+        session = FakeSession(get_responses=[FakeResponse(
+            status=302,
+            url=short_url,
+            headers={
+                "Location": (
+                    "https://i.y.qq.com/n2/m/share/details/taoge.html?id=1009789507"
+                )
+            },
+        )])
+        importer = PlaylistImporter()
+        importer._get_session = AsyncMock(return_value=session)
+
+        parsed = await importer.resolve_playlist_input(short_url)
+
+        self.assertEqual(parsed, ("qq", "1009789507"))
+        self.assertFalse(session.get_calls[0][1]["allow_redirects"])
+
+    async def test_qq_short_link_rejects_cross_domain_redirect(self):
+        short_url = "https://c6.y.qq.com/base/fcgi-bin/u?__=token"
+        session = FakeSession(get_responses=[FakeResponse(
+            status=302,
+            url=short_url,
+            headers={"Location": "http://127.0.0.1/private"},
+        )])
+        importer = PlaylistImporter()
+        importer._get_session = AsyncMock(return_value=session)
+
+        parsed = await importer.resolve_playlist_input(short_url)
+
+        self.assertEqual(parsed, ("qq", ""))
+
     async def test_complete_legacy_response_preserves_original_order(self):
         tracks = [qq_track(1), qq_track(2), qq_track(3)]
         tracks[0]["interval"] = 1200

@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
 
@@ -256,6 +256,63 @@ class PlaylistImporter:
         if text.isdigit():
             return "netease", text
         return "netease", ""
+
+    async def resolve_playlist_input(self, text: str) -> tuple[str, str]:
+        """解析歌单输入，并安全展开不含歌单 ID 的 QQ 官方短链接。"""
+        parsed = self.parse_playlist_input(text)
+        if parsed[1]:
+            return parsed
+
+        url_match = re.search(r"https?://[^\s]+", text, re.IGNORECASE)
+        if not url_match:
+            return parsed
+        current_url = url_match.group(0).rstrip(",.;，。；>)]】）")
+        initial_url = urlparse(current_url)
+        host = (initial_url.hostname or "").lower()
+        if initial_url.scheme.lower() != "https" or not self._host_matches(
+            host, "y.qq.com"
+        ):
+            return parsed
+
+        session = await self._get_session()
+        for _ in range(6):
+            try:
+                async with session.get(
+                    current_url,
+                    allow_redirects=False,
+                    headers={
+                        "User-Agent": MusicSearcher.HEADERS["User-Agent"],
+                        "Referer": "https://y.qq.com/",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    location = resp.headers.get("Location", "")
+                    response_url = str(resp.url)
+                    if resp.status not in {301, 302, 303, 307, 308}:
+                        location = ""
+            except Exception as e:
+                logger.warning(f"[KookMusic] QQ音乐短链接解析异常: {e}")
+                return parsed
+
+            candidate = urljoin(response_url or current_url, location)
+            if not location:
+                return self.parse_playlist_input(response_url or current_url)
+            candidate_url = urlparse(candidate)
+            candidate_host = (candidate_url.hostname or "").lower()
+            if candidate_url.scheme.lower() != "https" or not self._host_matches(
+                candidate_host, "y.qq.com"
+            ):
+                logger.warning(
+                    f"[KookMusic] 拒绝 QQ 短链接跳转到非官方域名: {candidate_host}"
+                )
+                return parsed
+            resolved = self.parse_playlist_input(candidate)
+            if resolved[1]:
+                return resolved
+            current_url = candidate
+
+        logger.warning("[KookMusic] QQ音乐短链接重定向次数过多")
+        return parsed
 
     @staticmethod
     def _host_matches(host: str, domain: str) -> bool:

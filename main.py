@@ -784,7 +784,9 @@ class KookMusicPlugin(Star):
             _playlist_import_requests[interaction_key] = request_marker
 
         # 官方链接自动识别平台；裸数字保持兼容，仍默认网易云。
-        import_type, target_id = PlaylistImporter.parse_playlist_input(raw_text)
+        import_type, target_id = await self.playlist_importer.resolve_playlist_input(
+            raw_text
+        )
         if not target_id:
             self._finish_playlist_import_request(interaction_key, request_marker)
             yield event.plain_result(
