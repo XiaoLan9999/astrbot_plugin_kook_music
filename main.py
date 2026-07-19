@@ -79,7 +79,16 @@ class KookMusicPlugin(Star):
         self.data_dir = Path("data/plugin_data/astrbot_plugin_kook_music")
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        self.searcher = MusicSearcher()
+        self.searcher = MusicSearcher(
+            qq_vip_resolver_url=self.config.get(
+                "qq_vip_resolver_url",
+                MusicSearcher.DEFAULT_QQ_VIP_RESOLVER_URL,
+            ),
+            qq_vip_resolver_quality=self.config.get(
+                "qq_vip_resolver_quality",
+                "320",
+            ),
+        )
         self.downloader = MusicDownloader(self.data_dir / "songs")
         self.bilibili = BilibiliExtractor()
         self.playlist_importer = PlaylistImporter()

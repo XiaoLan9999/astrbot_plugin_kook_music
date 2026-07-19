@@ -8,6 +8,7 @@
 import asyncio
 import ipaddress
 import logging
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -194,6 +195,12 @@ class MusicDownloader:
         try:
             address = ipaddress.ip_address(hostname)
         except ValueError:
+            labels = hostname.split(".")
+            if labels and all(
+                re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", label, re.IGNORECASE)
+                for label in labels
+            ):
+                return False
             return True
         return not (
             address.is_private

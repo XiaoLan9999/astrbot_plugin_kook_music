@@ -28,10 +28,18 @@ class FakeContent:
 
 
 class FakeResponse:
-    def __init__(self, data=None, body=b"", status=200, content_type="application/json"):
+    def __init__(
+        self,
+        data=None,
+        body=b"",
+        status=200,
+        content_type="application/json",
+        headers=None,
+    ):
         self.data = data
         self.status = status
         self.headers = {"Content-Type": content_type}
+        self.headers.update(headers or {})
         self.content = FakeContent(body)
 
     async def __aenter__(self):
@@ -58,6 +66,16 @@ class FakeSession:
     def post(self, *args, **kwargs):
         self.last_json = kwargs.get("json")
         return self.response
+
+
+class FakeSequenceSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.get_calls = []
+
+    def get(self, *args, **kwargs):
+        self.get_calls.append((args, kwargs))
+        return self.responses.pop(0)
 
 
 class MusicPlatformParsingTests(unittest.TestCase):
@@ -195,6 +213,32 @@ class MusicPlatformParsingTests(unittest.TestCase):
 
 
 class MusicPlatformAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_qq_search_with_vip_resolver_keeps_paid_candidates(self):
+        free = {
+            "mid": "free-mid",
+            "name": "free",
+            "file": {"media_mid": "free-media"},
+            "pay": {"pay_play": 0},
+        }
+        paid = {
+            "mid": "paid-mid",
+            "name": "paid",
+            "file": {"media_mid": "paid-media"},
+            "pay": {"pay_play": 1},
+        }
+        response = FakeResponse(data={
+            "req_0": {
+                "code": 0,
+                "data": {"body": {"song": {"list": [paid, free]}}},
+            }
+        })
+        searcher = MusicSearcher(
+            qq_vip_resolver_url="https://resolver.example/api"
+        )
+        searcher._get_session = AsyncMock(return_value=FakeSession(response))
+        songs = await searcher._search_qq_direct("keyword", 5)
+        self.assertEqual([song.id for song in songs], ["paid-mid", "free-mid"])
+
     async def test_qq_vkey_uses_media_mid_and_builds_stream_url(self):
         response = FakeResponse(data={
             "req_0": {
@@ -219,6 +263,268 @@ class MusicPlatformAsyncTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(song.audio_url.startswith("https://returned.example/"))
         self.assertEqual(song.unplayable_reason, "")
+
+    async def test_qq_denied_song_uses_meting_vip_resolver_by_exact_mid(self):
+        song_mid = "paid-mid"
+        direct = Song(
+            id=song_mid,
+            name="official title",
+            artists="official artist",
+            duration=162000,
+            cover_url="https://cover.example/image.jpg",
+            platform="qq",
+            unplayable_reason="该歌曲需要 QQ 音乐会员或受版权/地区限制",
+            provider_data={
+                "media_mid": "official-media-mid",
+                "resolver_status": "denied",
+            },
+        )
+        audio_url = "https://aqqmusic.tc.qq.com/C400official-media-mid.m4a?vkey=x"
+        session = FakeSequenceSession([
+            FakeResponse(data=[{
+                "songmid": song_mid,
+                "title": "resolver title must not replace official metadata",
+                "author": "resolver artist",
+                "url": (
+                    "https://resolver.example/api"
+                    f"?server=tencent&type=url&id={song_mid}"
+                ),
+            }]),
+            FakeResponse(
+                status=302,
+                headers={"Location": audio_url},
+            ),
+        ])
+        searcher = MusicSearcher(
+            qq_vip_resolver_url="https://resolver.example/api",
+            qq_vip_resolver_quality="flac",
+        )
+        searcher._fetch_qq_song_by_id = AsyncMock(return_value=direct)
+        searcher._get_session = AsyncMock(return_value=session)
+        searcher._search_via_aggregator = AsyncMock()
+
+        resolved = await searcher.fetch_song_by_id("qq", song_mid)
+
+        self.assertIs(resolved, direct)
+        self.assertEqual(resolved.audio_url, audio_url)
+        self.assertEqual(resolved.name, "official title")
+        self.assertEqual(resolved.artists, "official artist")
+        self.assertEqual(resolved.duration, 162000)
+        self.assertEqual(resolved.provider_data["media_mid"], "official-media-mid")
+        self.assertEqual(resolved.provider_data["resolver_status"], "resolved")
+        self.assertEqual(resolved.unplayable_reason, "")
+        self.assertEqual(session.get_calls[0][1]["params"]["id"], song_mid)
+        self.assertNotIn("mid", session.get_calls[0][1]["params"])
+        self.assertNotIn("quality", session.get_calls[0][1]["params"])
+        self.assertFalse(session.get_calls[1][1]["allow_redirects"])
+        searcher._search_via_aggregator.assert_not_awaited()
+
+    async def test_qq_meting_resolver_extracts_exact_mid_from_url(self):
+        song_mid = "paid-mid"
+        direct = Song(
+            id=song_mid,
+            name="official title",
+            platform="qq",
+            unplayable_reason="会员歌曲",
+            provider_data={"resolver_status": "denied"},
+        )
+        audio_url = "https://aqqmusic.tc.qq.com/C400paid-media.m4a?vkey=x"
+        session = FakeSequenceSession([
+            FakeResponse(data=[{
+                "title": "resolver title",
+                "author": "resolver artist",
+                "url": (
+                    "https://resolver.example/api"
+                    f"?server=tencent&type=url&id={song_mid}"
+                ),
+                "lrc": (
+                    "https://resolver.example/api"
+                    f"?server=tencent&type=lrc&id={song_mid}"
+                ),
+            }]),
+            FakeResponse(status=302, headers={"Location": audio_url}),
+        ])
+        searcher = MusicSearcher(
+            qq_vip_resolver_url="https://resolver.example/api"
+        )
+        searcher._fetch_qq_song_by_id = AsyncMock(return_value=direct)
+        searcher._get_session = AsyncMock(return_value=session)
+
+        resolved = await searcher.fetch_song_by_id("qq", song_mid)
+
+        self.assertIs(resolved, direct)
+        self.assertEqual(resolved.audio_url, audio_url)
+        self.assertEqual(resolved.provider_data["resolver_status"], "resolved")
+
+    async def test_qq_vip_resolver_rejects_non_qq_public_audio_host(self):
+        direct = Song(
+            id="paid-mid",
+            platform="qq",
+            unplayable_reason="会员歌曲",
+            provider_data={"resolver_status": "denied"},
+        )
+        searcher = MusicSearcher(
+            qq_vip_resolver_url="https://api.ygking.top/api/song/url"
+        )
+        searcher._fetch_qq_song_by_id = AsyncMock(return_value=direct)
+        searcher._get_session = AsyncMock(return_value=FakeSequenceSession([
+            FakeResponse(data={
+                "code": 0,
+                "data": {
+                    "paid-mid": "https://audio.example.test/paid.mp3",
+                },
+            }),
+        ]))
+
+        resolved = await searcher.fetch_song_by_id("qq", "paid-mid")
+
+        self.assertIs(resolved, direct)
+        self.assertEqual(resolved.audio_url, "")
+        self.assertEqual(resolved.provider_data["resolver_status"], "denied")
+
+    async def test_qq_denied_song_uses_ygking_vip_resolver_by_exact_mid(self):
+        song_mid = "paid-mid"
+        audio_url = "https://isure.stream.qqmusic.qq.com/paid.mp3?vkey=x"
+        direct = Song(
+            id=song_mid,
+            name="official title",
+            platform="qq",
+            unplayable_reason="会员歌曲",
+            provider_data={"resolver_status": "denied", "media_mid": "media-mid"},
+        )
+        session = FakeSequenceSession([FakeResponse(data={
+            "code": 0,
+            "data": {song_mid: audio_url},
+            "quality": "320",
+        })])
+        searcher = MusicSearcher(
+            qq_vip_resolver_url="https://api.ygking.top/api/song/url"
+        )
+        searcher._fetch_qq_song_by_id = AsyncMock(return_value=direct)
+        searcher._get_session = AsyncMock(return_value=session)
+
+        resolved = await searcher.fetch_song_by_id("qq", song_mid)
+
+        self.assertIs(resolved, direct)
+        self.assertEqual(resolved.audio_url, audio_url)
+        self.assertEqual(resolved.provider_data["resolver_status"], "resolved")
+        self.assertEqual(resolved.unplayable_reason, "")
+        self.assertEqual(session.get_calls[0][1]["params"], {
+            "mid": song_mid,
+            "quality": "320",
+        })
+
+    async def test_qq_vip_resolver_rejects_wrong_mid_and_unsafe_url(self):
+        cases = {
+            "wrong mid": {
+                "code": 0,
+                "data": {"other-mid": "https://audio.example/wrong.mp3"},
+            },
+            "unsafe url": {
+                "code": 0,
+                "data": {"paid-mid": "http://127.0.0.1/private.mp3"},
+            },
+        }
+        for label, response_data in cases.items():
+            with self.subTest(label=label):
+                direct = Song(
+                    id="paid-mid",
+                    name="official title",
+                    platform="qq",
+                    unplayable_reason="会员歌曲",
+                    provider_data={"resolver_status": "denied"},
+                )
+                searcher = MusicSearcher(
+                    qq_vip_resolver_url="https://resolver.example/api"
+                )
+                searcher._fetch_qq_song_by_id = AsyncMock(return_value=direct)
+                searcher._get_session = AsyncMock(return_value=FakeSequenceSession([
+                    FakeResponse(data=response_data),
+                ]))
+                searcher._search_via_aggregator = AsyncMock()
+
+                resolved = await searcher.fetch_song_by_id("qq", "paid-mid")
+
+                self.assertIs(resolved, direct)
+                self.assertEqual(resolved.audio_url, "")
+                self.assertEqual(resolved.unplayable_reason, "会员歌曲")
+                self.assertEqual(
+                    resolved.provider_data["resolver_status"],
+                    "denied",
+                )
+                searcher._search_via_aggregator.assert_not_awaited()
+
+    async def test_qq_vip_resolver_exception_preserves_denied_reason(self):
+        direct = Song(
+            id="paid-mid",
+            platform="qq",
+            unplayable_reason="会员歌曲",
+            provider_data={"resolver_status": "denied"},
+        )
+        searcher = MusicSearcher(
+            qq_vip_resolver_url="https://resolver.example/api"
+        )
+        searcher._fetch_qq_song_by_id = AsyncMock(return_value=direct)
+        searcher._get_session = AsyncMock(side_effect=RuntimeError("offline"))
+        searcher._search_via_aggregator = AsyncMock()
+
+        resolved = await searcher.fetch_song_by_id("qq", "paid-mid")
+
+        self.assertIs(resolved, direct)
+        self.assertEqual(resolved.audio_url, "")
+        self.assertEqual(resolved.unplayable_reason, "会员歌曲")
+        self.assertEqual(resolved.provider_data["resolver_status"], "denied")
+        searcher._search_via_aggregator.assert_not_awaited()
+
+    async def test_qq_vip_resolver_retry_clears_prior_denied_reason(self):
+        searcher = MusicSearcher(
+            qq_vip_resolver_url="https://resolver.example/api"
+        )
+        searcher.fetch_song_by_id = AsyncMock(return_value=Song(
+            id="paid-mid",
+            platform="qq",
+            audio_url="https://aqqmusic.tc.qq.com/paid.m4a?vkey=x",
+            provider_data={"resolver_status": "resolved"},
+        ))
+        song = Song(
+            id="paid-mid",
+            platform="qq",
+            unplayable_reason="会员歌曲",
+            provider_data={"resolver_status": "denied"},
+        )
+
+        resolved = await searcher.fetch_audio_url(song)
+
+        self.assertTrue(resolved.audio_url)
+        self.assertEqual(resolved.unplayable_reason, "")
+        self.assertEqual(resolved.provider_data["resolver_status"], "resolved")
+
+    async def test_qq_transient_resolver_failure_keeps_exact_id_fallback(self):
+        direct = Song(
+            id="same-mid",
+            platform="qq",
+            provider_data={"resolver_status": "transient"},
+        )
+        fallback = Song(
+            id="same-mid",
+            platform="qq",
+            audio_url="https://aqqmusic.tc.qq.com/audio.m4a",
+        )
+        searcher = MusicSearcher(
+            qq_vip_resolver_url="https://resolver.example/api"
+        )
+        searcher._fetch_qq_song_by_id = AsyncMock(return_value=direct)
+        searcher._get_session = AsyncMock(return_value=FakeSequenceSession([
+            FakeResponse(data={"code": 0, "data": {"wrong-mid": "https://x.test/a"}}),
+        ]))
+        searcher._search_via_aggregator = AsyncMock(return_value=[fallback])
+
+        resolved = await searcher.fetch_song_by_id("qq", "same-mid")
+
+        self.assertIs(resolved, fallback)
+        searcher._search_via_aggregator.assert_awaited_once_with(
+            "same-mid", "qq", 5, filter_type="id"
+        )
 
     async def test_exact_qq_failure_never_falls_back_to_wrong_name(self):
         searcher = MusicSearcher()
@@ -368,6 +674,27 @@ class MusicPlatformAsyncTests(unittest.IsolatedAsyncioTestCase):
             )
             result = await downloader.download(song)
             self.assertEqual(result.file_path, "")
+            downloader._get_session.assert_not_awaited()
+
+    async def test_downloader_blocks_ambiguous_private_address_notation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            downloader = MusicDownloader(Path(tmpdir))
+            downloader._get_session = AsyncMock()
+            for audio_url in (
+                "http://2130706433/audio.mp3",
+                "http://127.1/audio.mp3",
+                "http://0177.0.0.1/audio.mp3",
+                "http://0x7f000001/audio.mp3",
+            ):
+                with self.subTest(audio_url=audio_url):
+                    song = Song(
+                        id="unsafe",
+                        name="unsafe",
+                        platform="qq",
+                        audio_url=audio_url,
+                    )
+                    result = await downloader.download(song)
+                    self.assertEqual(result.file_path, "")
             downloader._get_session.assert_not_awaited()
 
 

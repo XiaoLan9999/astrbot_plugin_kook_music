@@ -65,6 +65,8 @@ class MusicSearcher:
 
     SEARCH_API_URL = "https://music.txqq.pro/"
     METING_API_URL = "https://api.qijieya.cn/meting/"
+    DEFAULT_QQ_VIP_RESOLVER_URL = "https://meting.mikus.ink/api"
+    QQ_VIP_RESOLVER_QUALITIES = {"128", "320", "flac"}
 
     HEADERS = {
         "User-Agent": (
@@ -84,6 +86,11 @@ class MusicSearcher:
     NETEASE_DETAIL_URL = "https://api.qijieya.cn/meting/?type=song&id={song_id}"
     QQ_MUSICU_URL = "https://u.y.qq.com/cgi-bin/musicu.fcg"
     QQ_STREAM_BASE_URL = "https://isure.stream.qqmusic.qq.com/"
+    QQ_AUDIO_HOSTS = {"aqqmusic.tc.qq.com"}
+    QQ_AUDIO_HOST_SUFFIXES = (
+        ".stream.qqmusic.qq.com",
+        ".music.tc.qq.com",
+    )
     KUGOU_SEARCH_URL = "https://songsearch.kugou.com/song_search_v2"
     KUGOU_PLAY_URL = "https://m.kugou.com/app/i/getSongInfo.php"
     KUGOU_API_HEADERS = {
@@ -96,8 +103,17 @@ class MusicSearcher:
         "kugou": "kugou",
     }
 
-    def __init__(self):
+    def __init__(
+        self,
+        qq_vip_resolver_url: str = "",
+        qq_vip_resolver_quality: str = "320",
+    ):
         self._session: aiohttp.ClientSession | None = None
+        self.qq_vip_resolver_url = str(qq_vip_resolver_url or "").strip()
+        quality = str(qq_vip_resolver_quality or "320").strip().lower()
+        self.qq_vip_resolver_quality = (
+            quality if quality in self.QQ_VIP_RESOLVER_QUALITIES else "320"
+        )
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is not None and not self._session.closed:
@@ -210,13 +226,18 @@ class MusicSearcher:
         except Exception as e:
             logger.warning(f"[KookMusic] QQ音乐直连搜索异常: {e}")
             return []
-        return self._parse_qq_search_songs(result, limit)
+        return self._parse_qq_search_songs(
+            result,
+            limit,
+            include_paid=bool(self.qq_vip_resolver_url),
+        )
 
     @classmethod
     def _parse_qq_search_songs(
         cls,
         result: object,
         limit: int,
+        include_paid: bool = False,
     ) -> list[Song]:
         if not isinstance(result, dict):
             return []
@@ -232,7 +253,7 @@ class MusicSearcher:
 
         songs: list[Song] = []
         for item in raw_songs:
-            song = cls._parse_qq_track(item, require_free=True)
+            song = cls._parse_qq_track(item, require_free=not include_paid)
             if song is None:
                 continue
             songs.append(song)
@@ -672,11 +693,14 @@ class MusicSearcher:
         """按稳定歌曲 ID 刷新临时播放地址。"""
         if song.audio_url:
             return song
-        if song.provider_data.get("resolver_status") == "denied":
-            return song
 
         platform = self.resolve_platform(song.platform or "netease")
         song.platform = platform
+        if (
+            song.provider_data.get("resolver_status") == "denied"
+            and not (platform == "qq" and self.qq_vip_resolver_url)
+        ):
+            return song
 
         if platform == "netease" and song.id:
             song = await self._fetch_netease_audio_url(song)
@@ -715,11 +739,15 @@ class MusicSearcher:
         direct_song: Song | None = None
         if platform == "qq":
             direct_song = await self._fetch_qq_song_by_id(song_id)
-            if direct_song and (
-                direct_song.audio_url
-                or direct_song.provider_data.get("resolver_status") == "denied"
-            ):
-                return direct_song
+            if direct_song:
+                if direct_song.audio_url:
+                    return direct_song
+                if self.qq_vip_resolver_url:
+                    await self._fill_qq_vip_resolver_url(direct_song)
+                    if direct_song.audio_url:
+                        return direct_song
+                if direct_song.provider_data.get("resolver_status") == "denied":
+                    return direct_song
             results = await self._search_via_aggregator(
                 song_id, platform, 5, filter_type="id"
             )
@@ -851,6 +879,88 @@ class MusicSearcher:
         logger.info(
             f"[KookMusic] QQ音乐歌曲不可播放 {song.id}: result={result_code}"
         )
+
+    async def _fill_qq_vip_resolver_url(self, song: Song) -> bool:
+        """通过配置的同 ID 解析源补充 QQ 会员歌曲播放地址。"""
+        if not self.qq_vip_resolver_url or not song.id:
+            return False
+
+        resolver_path = urlparse(self.qq_vip_resolver_url).path.rstrip("/").lower()
+        if resolver_path.endswith("/song/url"):
+            params = {
+                "mid": song.id,
+                "quality": self.qq_vip_resolver_quality,
+            }
+        else:
+            params = {
+                "server": "tencent",
+                "type": "song",
+                "id": song.id,
+            }
+        try:
+            session = await self._get_session()
+            async with session.get(
+                self.qq_vip_resolver_url,
+                params=params,
+                headers=self.HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                result = await resp.json(content_type=None)
+
+            audio_url = ""
+            if isinstance(result, dict) and result.get("code") in {0, "0"}:
+                data = result.get("data")
+                if isinstance(data, dict):
+                    candidate = data.get(song.id)
+                    if isinstance(candidate, str):
+                        audio_url = candidate.strip()
+            elif isinstance(result, list):
+                exact_match = False
+                for item in result:
+                    if not isinstance(item, dict):
+                        continue
+                    result_mid = str(item.get("songmid", "") or "")
+                    if not result_mid:
+                        result_mid = self._extract_meting_id(
+                            str(item.get("url", "") or "")
+                        ) or self._extract_meting_id(
+                            str(item.get("lrc", "") or "")
+                        )
+                    if result_mid == song.id:
+                        exact_match = True
+                        break
+                if not exact_match:
+                    return False
+                async with session.get(
+                    self.qq_vip_resolver_url,
+                    params={
+                        "server": "tencent",
+                        "type": "url",
+                        "id": song.id,
+                    },
+                    headers=self.HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    allow_redirects=False,
+                ) as resp:
+                    if 300 <= resp.status < 400:
+                        audio_url = str(resp.headers.get("Location", "") or "").strip()
+
+            if audio_url.startswith("http://"):
+                audio_url = "https://" + audio_url[len("http://"):]
+            if not audio_url or not self._is_qq_audio_url(audio_url):
+                return False
+        except Exception as e:
+            logger.warning(
+                f"[KookMusic] QQ音乐会员解析源异常 {song.id}: {e}"
+            )
+            return False
+
+        song.audio_url = audio_url
+        song.unplayable_reason = ""
+        song.provider_data["resolver_status"] = "resolved"
+        return True
 
     async def _fetch_kugou_song_by_id(self, song_id: str) -> Song | None:
         """按酷狗 FileHash 获取当次有效的完整歌曲 URL。"""
@@ -1080,6 +1190,12 @@ class MusicSearcher:
         try:
             address = ipaddress.ip_address(hostname)
         except ValueError:
+            labels = hostname.split(".")
+            if labels and all(
+                re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", label, re.IGNORECASE)
+                for label in labels
+            ):
+                return False
             return True
         return not (
             address.is_private
@@ -1088,6 +1204,19 @@ class MusicSearcher:
             or address.is_multicast
             or address.is_reserved
             or address.is_unspecified
+        )
+
+    @classmethod
+    def _is_qq_audio_url(cls, value: str) -> bool:
+        """会员解析源最终只允许返回 QQ 官方 HTTPS 音频 CDN。"""
+        if not cls._is_http_url(value):
+            return False
+        parsed = urlparse(value)
+        if parsed.scheme.lower() != "https":
+            return False
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+        return hostname in cls.QQ_AUDIO_HOSTS or any(
+            hostname.endswith(suffix) for suffix in cls.QQ_AUDIO_HOST_SUFFIXES
         )
 
     @staticmethod
@@ -1103,7 +1232,9 @@ class MusicSearcher:
             target.cover_url = source.cover_url
         if target.duration <= 0:
             target.duration = source.duration
-        if source.unplayable_reason:
+        if source.audio_url:
+            target.unplayable_reason = ""
+        elif source.unplayable_reason:
             target.unplayable_reason = source.unplayable_reason
         if source.provider_data:
             target.provider_data.update(source.provider_data)

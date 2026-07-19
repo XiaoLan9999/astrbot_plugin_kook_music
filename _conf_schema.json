@@ -13,6 +13,23 @@
         ],
         "default": "netease"
     },
+    "qq_vip_resolver_url": {
+        "description": "QQ音乐会员解析源",
+        "hint": "QQ 官方匿名接口无法播放会员歌曲时，按原歌曲 MID 调用此解析源。支持 Meting API 端点或 ygking song/url 端点；留空可禁用。",
+        "type": "string",
+        "default": "https://meting.mikus.ink/api"
+    },
+    "qq_vip_resolver_quality": {
+        "description": "QQ音乐解析音质",
+        "hint": "请求 ygking 解析源时使用的音质；Meting API 会忽略此项。",
+        "type": "string",
+        "options": [
+            "128",
+            "320",
+            "flac"
+        ],
+        "default": "320"
+    },
     "streaming_mode": {
         "description": "推流模式",
         "hint": "relay: 中继管道推流，RTP 流不中断，切歌更流畅（推荐）；direct: 每首歌独立推流，切歌时重建 RTP 连接。如果播放第二首歌没有声音，请尝试切换模式。",
