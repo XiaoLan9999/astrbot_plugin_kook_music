@@ -419,10 +419,12 @@ class KookMusicPlugin(Star):
         # 解析参数：歌名可含空格，平台名在末尾（如果匹配已知平台）
         if not raw_text:
             yield event.plain_result(
-                "用法：点歌 <歌名/网易云单曲链接/网易云电台节目链接> [平台]\n"
+                "用法：点歌 <歌名/单曲链接> [平台]\n"
                 "例如：点歌 青花瓷\n"
                 "例如：点歌 https://music.163.com/#/song?id=xxxx\n"
                 "例如：点歌 https://music.163.com/#/program?id=xxxx\n"
+                "例如：点歌 https://y.qq.com/n/ryqq/songDetail/xxxx\n"
+                "例如：点歌 https://www.kugou.com/song/#hash=xxxx\n"
                 "指定平台：点歌 青花瓷 qq\n"
                 "支持平台：netease / qq / kugou / kuwo / migu / baidu"
             )
@@ -481,6 +483,33 @@ class KookMusicPlugin(Star):
             await self._play_song(event, song, guild_id)
             return
 
+        # ---- QQ音乐 / 酷狗单曲链接：按平台稳定 ID 解析 ----
+        direct_platform = MusicSearcher.detect_direct_platform(raw_text)
+        if direct_platform:
+            msg_ids: list[str] = []
+            platform_label = "QQ音乐" if direct_platform == "qq" else "酷狗音乐"
+            if self._kook_token and channel_id:
+                msg_id = await send_text_message(
+                    self._kook_token,
+                    channel_id,
+                    f"🔗 正在解析{platform_label}单曲链接...",
+                )
+                if msg_id:
+                    msg_ids.append(msg_id)
+            else:
+                yield event.plain_result(f"🔗 正在解析{platform_label}单曲链接...")
+
+            song = await self.searcher.fetch_direct_song(raw_text)
+            await self._delete_messages(msg_ids)
+            if not song:
+                yield event.plain_result(
+                    f"❌ 无法从该链接取得{platform_label}歌曲 ID 或歌曲信息"
+                )
+                return
+
+            await self._play_song(event, song, guild_id)
+            return
+
         # ---- 其他平台：原有搜索流程 ----
         search_msg_ids: list[str] = []
         if self._kook_token and channel_id:
@@ -519,19 +548,32 @@ class KookMusicPlugin(Star):
             yield event.chain_result([Json(data=card_data)])
 
         # 等待用户选择
-        session_key = f"{event.get_sender_id()}_{guild_id}"
+        session_key = self._search_interaction_key(event, guild_id)
         future = asyncio.get_running_loop().create_future()
+        old_entry = None
         async with _pending_selections_lock:
+            old_entry = _pending_selections.pop(session_key, None)
             _pending_selections[session_key] = (songs, future, search_msg_ids)
+        if old_entry:
+            _, old_future, old_msg_ids = old_entry
+            if not old_future.done():
+                old_future.set_result(None)
+            await self._delete_messages(old_msg_ids)
 
         try:
-            selected: Song = await asyncio.wait_for(future, timeout=30)
+            selected: Song | None = await asyncio.wait_for(future, timeout=30)
+            if selected is None:
+                yield event.plain_result("ℹ️ 本次选歌已由新的搜索请求替换")
+                return
             await self._play_song(event, selected, guild_id)
         except asyncio.TimeoutError:
+            own_msg_ids: list[str] = []
             async with _pending_selections_lock:
-                entry = _pending_selections.pop(session_key, None)
-            if entry:
-                await self._delete_messages(entry[2])
+                entry = _pending_selections.get(session_key)
+                if entry and entry[1] is future:
+                    _pending_selections.pop(session_key, None)
+                    own_msg_ids = entry[2]
+            await self._delete_messages(own_msg_ids)
             yield event.plain_result("⏰ 选歌超时，已取消")
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -542,7 +584,7 @@ class KookMusicPlugin(Star):
 
         text = event.message_str.strip()
         guild_id = self._get_guild_id(event)
-        selection_key = f"{event.get_sender_id()}_{guild_id}"
+        selection_key = self._search_interaction_key(event, guild_id)
         range_key = self._playlist_interaction_key(event, guild_id)
 
         # 纯数字优先交给搜索选歌，避免与大型歌单区间等待互相抢消息。
@@ -889,6 +931,12 @@ class KookMusicPlugin(Star):
         """区间等待按用户、服务器和文字频道隔离。"""
         return f"{event.get_sender_id()}_{guild_id}_{self._get_channel_id(event)}"
 
+    def _search_interaction_key(
+        self, event: AstrMessageEvent, guild_id: str
+    ) -> str:
+        """选歌等待按用户、服务器和文字频道隔离。"""
+        return f"{event.get_sender_id()}_{guild_id}_{self._get_channel_id(event)}"
+
     @staticmethod
     def _finish_playlist_import_request(interaction_key: str, marker: object):
         if _playlist_import_requests.get(interaction_key) is marker:
@@ -1011,7 +1059,7 @@ class KookMusicPlugin(Star):
         if not song.audio_url:
             song = await self.searcher.fetch_audio_url(song)
         if not song.audio_url:
-            logger.error(f"[KookMusic] 无法获取音频链接: {song.name}")
+            logger.error(self._unplayable_message(song))
             return song
 
         # 下载到本地
@@ -1050,7 +1098,7 @@ class KookMusicPlugin(Star):
                 song = await self.searcher.fetch_audio_url(song)
             if not song.audio_url:
                 await event.send(
-                    event.plain_result(f"❌ 无法获取音频链接：{song.name}")
+                    event.plain_result(self._unplayable_message(song))
                 )
                 return
         else:
@@ -1069,7 +1117,7 @@ class KookMusicPlugin(Star):
                     song = await self.searcher.fetch_audio_url(song)
                 if not song.audio_url:
                     await event.send(
-                        event.plain_result(f"❌ 无法获取音频链接：{song.name}")
+                        event.plain_result(self._unplayable_message(song))
                     )
                     return
 
@@ -1080,7 +1128,7 @@ class KookMusicPlugin(Star):
 
             if not song.file_path:
                 await event.send(
-                    event.plain_result(f"❌ 下载失败：{song.name}")
+                    event.plain_result(self._unplayable_message(song, download=True))
                 )
                 return
 
@@ -1123,6 +1171,16 @@ class KookMusicPlugin(Star):
         else:
             await event.send(event.plain_result(f"❌ {msg}"))
             self.voice_manager._cleanup_song_file(song)
+
+    @staticmethod
+    def _unplayable_message(song: Song, download: bool = False) -> str:
+        action = "下载失败" if download else "无法获取音频链接"
+        message = f"❌ {action}：{song.name}"
+        if song.unplayable_reason:
+            message += f"\n原因：{song.unplayable_reason}"
+        elif song.platform in {"qq", "kugou"}:
+            message += "\n原因：该歌曲可能需要平台会员或受版权/地区限制"
+        return message
 
     async def _play_bilibili(
         self, event: AstrMessageEvent, keyword: str, guild_id: str

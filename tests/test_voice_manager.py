@@ -95,11 +95,11 @@ class BlockingDirectPlayer(DirectFFmpegPlayer):
         self._done.set()
 
 
-def make_song(name, downloaded=True):
+def make_song(name, downloaded=True, platform="netease"):
     return Song(
         id=name,
         name=name,
-        platform="netease",
+        platform=platform,
         file_path=name if downloaded else "",
     )
 
@@ -153,6 +153,42 @@ class VoiceManagerPlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(downloaded, ["list-1", "bad"])
         self.assertEqual(session.playlist, [])
         self.assertEqual(voice.connect_calls, 2)
+
+    async def test_mixed_platform_failure_does_not_break_song_flow(self):
+        songs = [
+            make_song("netease-a"),
+            make_song("qq-free", downloaded=False, platform="qq"),
+            make_song("kg-paid", downloaded=False, platform="kugou"),
+            make_song("kg-free", downloaded=False, platform="kugou"),
+            make_song("netease-b"),
+        ]
+        manager, session, player, _ = self.make_manager(songs)
+        attempted = []
+
+        async def download(song):
+            attempted.append((song.platform, song.name))
+            if song.name == "qq-free":
+                song.file_path = "qq-free.m4a"
+            elif song.name == "kg-free":
+                song.file_path = "kg-free.mp3"
+            return song
+
+        manager.on_download_song = download
+        await manager._playback_loop("guild")
+
+        self.assertEqual(
+            attempted,
+            [
+                ("qq", "qq-free"),
+                ("kugou", "kg-paid"),
+                ("kugou", "kg-free"),
+            ],
+        )
+        self.assertEqual(
+            player.played,
+            ["netease-a", "qq-free.m4a", "kg-free.mp3", "netease-b"],
+        )
+        self.assertEqual(session.playlist, [])
 
     async def test_two_rapid_skips_advance_two_distinct_songs(self):
         manager, session, player, _ = self.make_manager(

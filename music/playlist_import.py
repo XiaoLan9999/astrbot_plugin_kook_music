@@ -9,6 +9,7 @@
 import asyncio
 import logging
 import re
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -102,6 +103,20 @@ class PlaylistImporter:
             (type, id) — type 为 "song" 或 "program"，id 为空表示未识别。
         """
         text = text.strip()
+
+        # 只允许网易云官方域名进入网易链接正则，避免旧式 QQ 链接中的
+        # `/song/0039Mn...` 被截断误识别为网易歌曲 0039。
+        url_match = re.search(r"https?://[^\s]+", text, re.IGNORECASE)
+        if url_match:
+            host = (urlparse(url_match.group(0)).hostname or "").lower()
+            is_netease_host = (
+                host == "music.163.com"
+                or host.endswith(".music.163.com")
+                or host == "163cn.tv"
+                or host.endswith(".163cn.tv")
+            )
+            if not is_netease_host:
+                return "", ""
 
         # 电台节目链接中也可能带多个参数，必须优先识别 program。
         m = _NETEASE_PROGRAM_LINK_ID_PATTERN.search(text)

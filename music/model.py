@@ -38,6 +38,12 @@ class Song:
     extra_headers: dict = field(default_factory=dict)
     """下载时的额外请求头（如 B站防盗链 Referer）"""
 
+    unplayable_reason: str = ""
+    """平台明确返回不可播放时的原因（如会员或版权限制）"""
+
+    provider_data: dict = field(default_factory=dict)
+    """平台解析器刷新播放地址所需的稳定元数据"""
+
     @property
     def display_name(self) -> str:
         """用于显示的歌曲名"""

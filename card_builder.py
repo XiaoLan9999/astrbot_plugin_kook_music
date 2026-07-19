@@ -8,6 +8,19 @@ from .music.model import Song
 
 
 WATERMARK_TEXT = "[Powered By XiaoLan9999](https://XiaoLan9999.net)"
+_PLATFORM_LABELS = {
+    "netease": "网易云音乐",
+    "qq": "QQ音乐",
+    "kugou": "酷狗音乐",
+    "kuwo": "酷我音乐",
+    "migu": "咪咕音乐",
+    "baidu": "百度音乐",
+    "bilibili": "哔哩哔哩",
+}
+
+
+def _platform_label(platform: str) -> str:
+    return _PLATFORM_LABELS.get(platform, platform or "未知")
 
 
 def _append_watermark(modules: list[dict]):
@@ -105,7 +118,7 @@ def build_now_playing_card(
     if song.platform:
         context_elements.append({
             "type": "kmarkdown",
-            "content": f"来源：**{song.platform}**"
+            "content": f"来源：**{_platform_label(song.platform)}**"
         })
     if song.requester_name:
         context_elements.append({
@@ -232,7 +245,10 @@ def build_search_result_card(
 
     lines = []
     for i, song in enumerate(songs, 1):
-        lines.append(f"**{i}.** {song.name} - {song.artists}")
+        lines.append(
+            f"**{i}.** [{_platform_label(song.platform)}] "
+            f"{song.name} - {song.artists}"
+        )
     modules.append({
         "type": "section",
         "text": {"type": "kmarkdown", "content": "\n".join(lines)}
