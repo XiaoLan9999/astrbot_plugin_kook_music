@@ -90,6 +90,15 @@ class _FakeBilibili:
         return songs
 
 
+class _FailingBilibiliResolver:
+    def __init__(self):
+        self.inputs = []
+
+    async def resolve_input(self, text):
+        self.inputs.append(text)
+        return ""
+
+
 class _BlockingVoiceManager:
     def __init__(self):
         self.lookup_started = asyncio.Event()
@@ -170,6 +179,31 @@ class BilibiliBatchRequestTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(plugin.voice_manager.join_calls, 0)
         self.assertTrue(any("已由更新" in str(message) for message in event.sent))
+
+    async def test_video_parse_progress_does_not_echo_raw_link(self):
+        plugin = object.__new__(main_module.KookMusicPlugin)
+        plugin._kook_token = "token"
+        plugin._is_kook = lambda _event: True
+        plugin._get_guild_id = lambda _event: "guild"
+        plugin._get_channel_id = lambda _event: "text"
+        plugin.bilibili = _FailingBilibiliResolver()
+
+        raw_link = (
+            "https://www.bilibili.com/video/BV1ANQqBTEVU"
+            "?spm_id_from=secret-tracking-value"
+        )
+        event = _FakeEvent()
+        event.message_str = f"#播放 {raw_link}"
+
+        yielded = []
+        async for result in plugin.on_play_video(event):
+            yielded.append(result)
+
+        self.assertEqual(plugin.bilibili.inputs, [raw_link])
+        rendered_messages = " ".join(str(message) for message in event.sent + yielded)
+        self.assertIn("正在解析", rendered_messages)
+        self.assertNotIn(raw_link, rendered_messages)
+        self.assertNotIn("secret-tracking-value", rendered_messages)
 
 
 if __name__ == "__main__":

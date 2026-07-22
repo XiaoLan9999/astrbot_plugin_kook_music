@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Union
 
@@ -37,6 +38,7 @@ class GuildSession:
     needs_direct_refresh: bool = False
     pending_skips: int = 0
     playback_retry_count: int = 0
+    preparation_task: asyncio.Task | None = field(default=None, repr=False)
 
     @property
     def current_song(self) -> Song | None:
@@ -59,12 +61,15 @@ class VoiceManager:
 
     # FFmpeg 播放超时额外缓冲（秒）
     PLAYBACK_TIMEOUT_BUFFER = 30
-    # 未知时长歌曲的默认最大超时（秒）
-    DEFAULT_MAX_TIMEOUT = 600
     PLAYBACK_START_DELAY = 1.0
     DIRECT_RECONNECT_DELAY = 0.5
     PLAYBACK_RETRY_DELAY = 5.0
     MAX_PLAYBACK_RETRIES = 3
+    STREAM_RESUME_MAX_ATTEMPTS = 1
+    STREAM_RESUME_REWIND_SECONDS = 5.0
+    _STREAM_RESUME_OFFSET_KEY = "_kook_music_stream_resume_offset"
+    _STREAM_RESUME_ATTEMPTS_KEY = "_kook_music_stream_resume_attempts"
+    _STREAM_NOTIFIED_KEY = "_kook_music_stream_notified"
 
     def __init__(
         self,
@@ -171,6 +176,12 @@ class VoiceManager:
                 available = self.max_queue_size - len(session.playlist)
                 if len(songs) > available:
                     return False, f"播放队列容量不足，目前最多还能加入 {available} 首"
+                for queued_song in songs:
+                    if queued_song.stream_url:
+                        # 并发首播请求可能在解析流地址期间被另一首歌抢先建会话。
+                        # 临时签名 URL 不能带入等待队列，轮到时再 fresh 解析。
+                        queued_song.stream_url = ""
+                        queued_song.extra_headers = {}
                 start_pos = len(session.playlist) + 1
                 session.playlist.extend(songs)
                 session.idle_seconds = 0
@@ -266,6 +277,9 @@ class VoiceManager:
             return False, "Bot 不在语音频道中"
         if len(session.playlist) >= self.max_queue_size:
             return False, f"播放队列已满（最大 {self.max_queue_size} 首）"
+        if song.stream_url:
+            song.stream_url = ""
+            song.extra_headers = {}
         session.playlist.append(song)
         pos = len(session.playlist)
         session.idle_seconds = 0
@@ -285,6 +299,9 @@ class VoiceManager:
         session.pending_skips += 1
         if not session.is_playing:
             self._start_playback_loop(guild_id)
+        preparation_task = session.preparation_task
+        if preparation_task and not preparation_task.done():
+            preparation_task.cancel()
         await session.ffmpeg_player.stop()
         return True, "已跳过一首歌曲"
 
@@ -513,39 +530,58 @@ class VoiceManager:
 
                 song = session.playlist[0]
 
-                # ---- 延迟下载：在播放前才下载歌曲 ----
-                if not song.file_path:
+                # ---- 延迟准备：在播放前才下载歌曲或解析临时流地址 ----
+                if not song.playback_source:
                     if self.on_download_song:
+                        preparing_session = session
+                        preparation_task = asyncio.create_task(
+                            self.on_download_song(song)
+                        )
+                        preparing_session.preparation_task = preparation_task
                         try:
-                            logger.info(f"[KookMusic] 开始下载队列歌曲: {song.name}")
-                            updated_song = await self.on_download_song(song)
+                            logger.info(f"[KookMusic] 开始准备队列歌曲: {song.name}")
+                            updated_song = await preparation_task
                             # 重新检查 session 是否仍然有效
                             if guild_id not in self.sessions:
                                 break
                             session = self.sessions[guild_id]
                             if session.pending_skips > 0:
-                                if updated_song and updated_song.file_path:
+                                if updated_song and updated_song.playback_source:
                                     song = updated_song
                                     if session.playlist and session.playlist[0] is not song:
                                         session.playlist[0] = song
                                 self._consume_pending_skip(session)
                                 continue
                             # 更新队列中的歌曲对象
-                            if updated_song and updated_song.file_path:
+                            if updated_song and updated_song.playback_source:
                                 if session.playlist and session.playlist[0] is song:
                                     session.playlist[0] = updated_song
                                     song = updated_song
                             else:
-                                logger.error(f"[KookMusic] 下载失败: {song.name}")
+                                logger.error(f"[KookMusic] 音频准备失败: {song.name}")
                                 self._drop_failed_current(session, song)
                                 continue
+                        except asyncio.CancelledError:
+                            current_session = self.sessions.get(guild_id)
+                            if (
+                                current_session is preparing_session
+                                and current_session.pending_skips > 0
+                            ):
+                                self._consume_pending_skip(current_session)
+                                continue
+                            raise
                         except Exception as e:
-                            logger.error(f"[KookMusic] 下载异常: {song.name}: {e}")
+                            logger.error(f"[KookMusic] 音频准备异常: {song.name}: {e}")
                             if guild_id in self.sessions:
                                 self._drop_failed_current(self.sessions[guild_id], song)
                             continue
+                        finally:
+                            if preparing_session.preparation_task is preparation_task:
+                                preparing_session.preparation_task = None
                     else:
-                        logger.warning(f"[KookMusic] 歌曲无本地文件且无下载回调: {song.name}")
+                        logger.warning(
+                            f"[KookMusic] 歌曲无播放源且无准备回调: {song.name}"
+                        )
                         self._drop_failed_current(session, song)
                         continue
 
@@ -586,29 +622,78 @@ class VoiceManager:
                     self._consume_pending_skip(session)
                     continue
 
+                playback_source = song.playback_source
+                stream_headers = song.extra_headers if song.stream_url else None
+                try:
+                    resume_offset = max(
+                        0.0,
+                        float(song.provider_data.get(self._STREAM_RESUME_OFFSET_KEY, 0)),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    resume_offset = 0.0
+                try:
+                    resume_attempts = max(
+                        0,
+                        int(song.provider_data.get(self._STREAM_RESUME_ATTEMPTS_KEY, 0)),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    resume_attempts = 0
+                play_options = {"extra_headers": stream_headers}
+                if resume_offset > 0:
+                    play_options["start_seconds"] = resume_offset
                 if is_relay:
                     # ---- relay 模式：直接播放，不需要 RTP 参数 ----
-                    ok = await player.play(song.file_path)
+                    ok = await player.play(
+                        playback_source,
+                        **play_options,
+                    )
                 else:
                     # ---- direct 模式：每首歌传入 RTP 参数 ----
                     ok = await player.play(
-                        song.file_path,
+                        playback_source,
                         session.voice_client.rtp_url,
                         session.voice_client.ssrc,
+                        **play_options,
                     )
                     # Direct 的 Transport 在一次播放尝试后即视为已使用；即使
                     # 启动阶段被切歌终止，下一首也必须刷新 RTP，避免无声。
                     session.needs_direct_refresh = True
 
+                # skip 可能发生在最后一次检查之后、FFmpeg 启动 await 期间。
+                # 启动返回后再检查一次，避免“停止了空播放器，随后反而开始播”。
+                if session.pending_skips > 0:
+                    if ok:
+                        await player.stop()
+                    self._consume_pending_skip(session)
+                    continue
+
                 if not ok:
+                    if (
+                        song.stream_url
+                        and resume_attempts < self.STREAM_RESUME_MAX_ATTEMPTS
+                    ):
+                        song.stream_url = ""
+                        song.extra_headers = {}
+                        song.provider_data[self._STREAM_RESUME_ATTEMPTS_KEY] = (
+                            resume_attempts + 1
+                        )
+                        logger.warning(
+                            f"[KookMusic] B站流启动失败，fresh 解析后重试: {song.name}"
+                        )
+                        continue
                     logger.error(f"[KookMusic] 播放失败: {song.name}")
+                    self._clear_stream_resume_state(song)
                     if guild_id in self.sessions:
                         self._drop_failed_current(self.sessions[guild_id], song)
                     continue
                 session.playback_retry_count = 0
+                segment_started_at = time.monotonic()
 
                 # 通知外部：新歌曲开始播放（用于发送卡片消息）
-                if self.on_song_started:
+                if (
+                    self.on_song_started
+                    and not song.provider_data.get(self._STREAM_NOTIFIED_KEY)
+                ):
                     try:
                         current_session = self.sessions.get(guild_id)
                         queue_size = len(current_session.playlist) if current_session else 0
@@ -618,27 +703,71 @@ class VoiceManager:
                             await result
                     except Exception as e:
                         logger.debug(f"[KookMusic] 歌曲开始回调异常: {e}")
+                    finally:
+                        song.provider_data[self._STREAM_NOTIFIED_KEY] = True
 
                 # 计算播放超时：歌曲时长(ms->s) + 缓冲时间
                 if song.duration > 0:
-                    timeout = (song.duration / 1000) + self.PLAYBACK_TIMEOUT_BUFFER
+                    remaining_seconds = max(
+                        0.0,
+                        (song.duration / 1000) - resume_offset,
+                    )
+                    timeout = remaining_seconds + self.PLAYBACK_TIMEOUT_BUFFER
+                    logger.debug(
+                        f"[KookMusic] 播放超时设定: {timeout:.0f}s "
+                        f"(时长={song.duration}ms)"
+                    )
                 else:
-                    timeout = self.DEFAULT_MAX_TIMEOUT
-                logger.debug(
-                    f"[KookMusic] 播放超时设定: {timeout:.0f}s "
-                    f"(时长={song.duration}ms)"
-                )
+                    # 未知时长不能用固定分钟数截断；远程输入由 FFmpeg 的
+                    # rw_timeout 负责处理卡死，用户切歌/退出仍会立即 kill。
+                    timeout = None
+                    logger.debug("[KookMusic] 歌曲时长未知，等待 FFmpeg 自然结束")
 
                 # 等待播放完成（带超时保护）
-                await player.wait_until_done(timeout=timeout)
+                playback_completed = await player.wait_until_done(timeout=timeout)
+                segment_elapsed = max(0.0, time.monotonic() - segment_started_at)
 
                 # 确保歌曲进程已清理（stop 是幂等的，重复调用无副作用）
                 await player.stop()
+                was_stream = bool(song.stream_url)
+                if was_stream:
+                    # CDN 签名地址只对本次播放有效。循环重播或列表再次轮到时
+                    # 必须重新解析，不能复用可能已经过期的地址。
+                    song.stream_url = ""
+                    song.extra_headers = {}
 
                 # 重新检查 session 有效性
                 if guild_id not in self.sessions:
                     break
                 session = self.sessions[guild_id]
+                if (
+                    not playback_completed
+                    and session.pending_skips <= 0
+                    and was_stream
+                    and resume_attempts < self.STREAM_RESUME_MAX_ATTEMPTS
+                ):
+                    next_offset = max(
+                        0.0,
+                        resume_offset
+                        + segment_elapsed
+                        - self.STREAM_RESUME_REWIND_SECONDS,
+                    )
+                    duration_seconds = song.duration / 1000 if song.duration > 0 else 0
+                    if duration_seconds <= 0 or next_offset < duration_seconds - 1:
+                        song.provider_data[self._STREAM_RESUME_OFFSET_KEY] = next_offset
+                        song.provider_data[self._STREAM_RESUME_ATTEMPTS_KEY] = (
+                            resume_attempts + 1
+                        )
+                        logger.warning(
+                            f"[KookMusic] B站流异常中断，将 fresh 解析并从 "
+                            f"{next_offset:.0f}s 附近续播: {song.name}"
+                        )
+                        continue
+                if not playback_completed and session.pending_skips <= 0:
+                    logger.warning(
+                        f"[KookMusic] 歌曲未正常播放完毕，继续后续队列: {song.name}"
+                    )
+                self._clear_stream_resume_state(song)
                 # 处理循环模式
                 if guild_id not in self.sessions:
                     break
@@ -758,8 +887,14 @@ class VoiceManager:
         return True
 
     @staticmethod
+    def _clear_stream_resume_state(song: Song):
+        song.provider_data.pop(VoiceManager._STREAM_RESUME_OFFSET_KEY, None)
+        song.provider_data.pop(VoiceManager._STREAM_RESUME_ATTEMPTS_KEY, None)
+        song.provider_data.pop(VoiceManager._STREAM_NOTIFIED_KEY, None)
+
+    @staticmethod
     def _cleanup_song_file(song: Song):
-        """清理单首歌曲的缓存文件"""
+        """清理单首歌曲的本地缓存与当前临时流。"""
         if song.file_path:
             try:
                 import os
@@ -767,6 +902,10 @@ class VoiceManager:
                     os.unlink(song.file_path)
             except Exception:
                 pass
+            song.file_path = ""
+        song.stream_url = ""
+        song.extra_headers = {}
+        VoiceManager._clear_stream_resume_state(song)
 
     async def _cleanup_session(self, guild_id: str):
         """清理会话"""

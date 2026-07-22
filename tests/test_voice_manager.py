@@ -3,7 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 PLUGINS_DIR = Path(__file__).resolve().parents[2]
@@ -46,6 +46,9 @@ class FakeVoiceClient:
 class AutoDirectPlayer(DirectFFmpegPlayer):
     def __init__(self, fail_paths=None):
         self.played = []
+        self.play_headers = []
+        self.play_offsets = []
+        self.wait_timeouts = []
         self.fail_paths = set(fail_paths or [])
         self._playing = False
 
@@ -53,12 +56,22 @@ class AutoDirectPlayer(DirectFFmpegPlayer):
     def is_playing(self):
         return self._playing
 
-    async def play(self, file_path, rtp_url, ssrc):
+    async def play(
+        self,
+        file_path,
+        rtp_url,
+        ssrc,
+        extra_headers=None,
+        start_seconds=0.0,
+    ):
         self.played.append(file_path)
+        self.play_headers.append(extra_headers or {})
+        self.play_offsets.append(start_seconds)
         self._playing = file_path not in self.fail_paths
         return self._playing
 
     async def wait_until_done(self, timeout=None):
+        self.wait_timeouts.append(timeout)
         self._playing = False
         return True
 
@@ -69,6 +82,9 @@ class AutoDirectPlayer(DirectFFmpegPlayer):
 class BlockingDirectPlayer(DirectFFmpegPlayer):
     def __init__(self):
         self.played = []
+        self.play_headers = []
+        self.play_offsets = []
+        self.wait_timeouts = []
         self._playing = False
         self._done = asyncio.Event()
 
@@ -76,13 +92,23 @@ class BlockingDirectPlayer(DirectFFmpegPlayer):
     def is_playing(self):
         return self._playing
 
-    async def play(self, file_path, rtp_url, ssrc):
+    async def play(
+        self,
+        file_path,
+        rtp_url,
+        ssrc,
+        extra_headers=None,
+        start_seconds=0.0,
+    ):
         self.played.append(file_path)
+        self.play_headers.append(extra_headers or {})
+        self.play_offsets.append(start_seconds)
         self._playing = True
         self._done = asyncio.Event()
         return True
 
     async def wait_until_done(self, timeout=None):
+        self.wait_timeouts.append(timeout)
         await self._done.wait()
         return True
 
@@ -190,6 +216,161 @@ class VoiceManagerPlaybackTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(session.playlist, [])
 
+    async def test_stream_source_is_ready_without_download_and_passes_headers(self):
+        stream_url = "https://cdn.example.test/audio.m4s?token=secret"
+        headers = {
+            "Referer": "https://www.bilibili.com/",
+            "User-Agent": "test-agent",
+        }
+        song = Song(
+            id="long-video",
+            name="long-video",
+            platform="bilibili",
+            stream_url=stream_url,
+            extra_headers=headers,
+        )
+        manager, _, player, _ = self.make_manager([song])
+        download_calls = []
+
+        async def download(queued_song):
+            download_calls.append(queued_song.id)
+            return queued_song
+
+        manager.on_download_song = download
+        await manager._playback_loop("guild")
+
+        self.assertEqual(download_calls, [])
+        self.assertEqual(player.played, [stream_url])
+        self.assertEqual(player.play_headers, [headers])
+
+    async def test_download_callback_may_prepare_stream_instead_of_local_file(self):
+        song = make_song("lazy-long-video", downloaded=False, platform="bilibili")
+        manager, session, player, _ = self.make_manager([song])
+        stream_url = "https://cdn.example.test/lazy.m4s?expires=999999"
+        headers = {"Referer": "https://www.bilibili.com/"}
+
+        async def prepare(queued_song):
+            queued_song.stream_url = stream_url
+            queued_song.extra_headers = headers
+            return queued_song
+
+        manager.on_download_song = prepare
+        await manager._playback_loop("guild")
+
+        self.assertEqual(player.played, [stream_url])
+        self.assertEqual(player.play_headers, [headers])
+        self.assertEqual(session.playlist, [])
+
+    async def test_long_and_unknown_durations_use_safe_playback_timeouts(self):
+        unknown = Song(
+            id="unknown",
+            name="unknown",
+            stream_url="https://cdn.example.test/unknown.m4s",
+        )
+        three_hours = Song(
+            id="three-hours",
+            name="three-hours",
+            duration=3 * 60 * 60 * 1000,
+            stream_url="https://cdn.example.test/three-hours.m4s",
+        )
+        manager, _, player, _ = self.make_manager([unknown, three_hours])
+
+        await manager._playback_loop("guild")
+
+        self.assertEqual(player.wait_timeouts, [None, 10830.0])
+
+    async def test_stream_url_is_refreshed_before_loop_replay(self):
+        song = Song(
+            id="looped-stream",
+            name="looped-stream",
+            duration=60_000,
+            platform="bilibili",
+            stream_url="https://cdn.example.test/first.m4s?token=first",
+            extra_headers={"Referer": "https://www.bilibili.com/"},
+        )
+        manager, session, player, _ = self.make_manager([song])
+        session.loop_mode = 1
+        prepare_calls = []
+
+        async def prepare(queued_song):
+            prepare_calls.append(queued_song.id)
+            queued_song.stream_url = (
+                "https://cdn.example.test/second.m4s?token=second"
+            )
+            queued_song.extra_headers = {
+                "Referer": "https://www.bilibili.com/"
+            }
+            return queued_song
+
+        async def song_started(_guild_id, _song, _queue_size, _loop_name):
+            if len(player.played) == 2:
+                session.loop_mode = 0
+
+        manager.on_download_song = prepare
+        manager.on_song_started = song_started
+
+        await manager._playback_loop("guild")
+
+        self.assertEqual(
+            player.played,
+            [
+                "https://cdn.example.test/first.m4s?token=first",
+                "https://cdn.example.test/second.m4s?token=second",
+            ],
+        )
+        self.assertEqual(prepare_calls, ["looped-stream"])
+        self.assertEqual(session.playlist, [])
+
+    async def test_interrupted_stream_refreshes_and_resumes_once(self):
+        class FailFirstCompletionPlayer(AutoDirectPlayer):
+            async def wait_until_done(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                self._playing = False
+                return len(self.wait_timeouts) > 1
+
+        first_url = "https://cdn.example.test/first.m4s?token=first"
+        second_url = "https://cdn.example.test/second.m4s?token=second"
+        song = Song(
+            id="resumed-stream",
+            name="resumed-stream",
+            duration=3 * 60 * 60 * 1000,
+            platform="bilibili",
+            stream_url=first_url,
+            extra_headers={"Referer": "https://www.bilibili.com/"},
+        )
+        player = FailFirstCompletionPlayer()
+        manager, session, _, _ = self.make_manager([song], player)
+        prepared = []
+        started = []
+
+        async def prepare(queued_song):
+            prepared.append(queued_song.id)
+            queued_song.stream_url = second_url
+            queued_song.extra_headers = {
+                "Referer": "https://www.bilibili.com/"
+            }
+            return queued_song
+
+        async def on_started(*_args):
+            started.append(song.id)
+
+        manager.on_download_song = prepare
+        manager.on_song_started = on_started
+        fake_time = Mock()
+        fake_time.monotonic.side_effect = [100.0, 700.0, 701.0, 1301.0]
+        with patch(
+            "astrbot_plugin_kook_music.kook_voice.voice_manager.time",
+            fake_time,
+        ):
+            await manager._playback_loop("guild")
+
+        self.assertEqual(player.played, [first_url, second_url])
+        self.assertEqual(player.play_offsets, [0.0, 595.0])
+        self.assertEqual(prepared, ["resumed-stream"])
+        self.assertEqual(started, ["resumed-stream"])
+        self.assertEqual(session.playlist, [])
+        self.assertNotIn(manager._STREAM_RESUME_OFFSET_KEY, song.provider_data)
+
     async def test_two_rapid_skips_advance_two_distinct_songs(self):
         manager, session, player, _ = self.make_manager(
             [make_song("a"), make_song("b"), make_song("c")],
@@ -276,6 +457,37 @@ class VoiceManagerPlaybackTests(unittest.IsolatedAsyncioTestCase):
             ["current", "point-a", "list-1", "list-2", "point-b"],
         )
         self.assertEqual([song.name for song in session.playlist], before_rejected)
+
+    async def test_queued_stream_discards_signed_url_until_it_reaches_head(self):
+        manager, session, _, _ = self.make_manager(
+            [make_song("current")],
+            BlockingDirectPlayer(),
+        )
+        session.is_playing = True
+        queued = Song(
+            id="queued-long",
+            name="queued-long",
+            platform="bilibili",
+            stream_url="https://cdn.example.test/audio.m4s?token=soon-expired",
+            extra_headers={
+                "Referer": "https://www.bilibili.com/",
+                "User-Agent": "test-agent",
+            },
+        )
+
+        ok, message = await manager.join_and_play(
+            "token",
+            "guild",
+            "voice",
+            "text",
+            queued,
+        )
+
+        self.assertTrue(ok)
+        self.assertTrue(message.startswith("QUEUED:"))
+        self.assertIs(session.playlist[-1], queued)
+        self.assertEqual(queued.stream_url, "")
+        self.assertEqual(queued.extra_headers, {})
 
     async def test_concurrent_first_join_creates_one_session_and_one_client(self):
         manager = VoiceManager(max_queue_size=10, streaming_mode="direct")

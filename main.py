@@ -77,6 +77,12 @@ class KookMusicPlugin(Star):
         self.max_sessions = self.config.get("max_sessions", 5)
         self.volume = self._parse_volume(self.config.get("volume", "0.15"))
         self.streaming_mode = self.config.get("streaming_mode", "relay")
+        self.bili_stream_threshold_minutes = self._parse_int_range(
+            self.config.get("bili_stream_threshold_minutes", 30),
+            30,
+            0,
+            1440,
+        )
 
         # 核心组件
         self.data_dir = Path("data/plugin_data/astrbot_plugin_kook_music")
@@ -772,7 +778,7 @@ class KookMusicPlugin(Star):
 
         try:
             await event.send(event.plain_result(
-                f"🔍 正在解析视频内容：{raw_text}..."
+                "🔍 正在解析B站内容，请稍候..."
             ))
             resolved_text = await self.bilibili.resolve_input(raw_text)
             if not resolved_text:
@@ -1147,11 +1153,13 @@ class KookMusicPlugin(Star):
 
         由 VoiceManager 的播放循环在播放每首歌前调用。
         """
-        # B站平台：使用 yt-dlp 下载
+        # B站平台：短视频延迟下载，长视频/未知时长在开播前解析临时音频流。
         if song.platform == "bilibili":
-            if not song.file_path:
-                song = await self.bilibili.download_audio(
-                    song, self.data_dir / "songs"
+            if not song.playback_source:
+                song = await self.bilibili.prepare_audio(
+                    song,
+                    self.data_dir / "songs",
+                    self.bili_stream_threshold_minutes,
                 )
             return song
 
@@ -1202,15 +1210,16 @@ class KookMusicPlugin(Star):
                 )
                 return
         else:
-            # ---- 首次播放：立即获取URL并下载 ----
+            # ---- 首次播放：立即准备本地文件或长视频临时流 ----
             if song.platform == "bilibili":
-                # B站平台：使用 yt-dlp 下载音频
+                use_stream = self.bilibili.should_stream_audio(
+                    song, self.bili_stream_threshold_minutes
+                )
+                action = "准备B站流式播放" if use_stream else "下载B站音频"
                 await event.send(
-                    event.plain_result(f"⏬ 正在下载B站音频：{song.display_name}...")
+                    event.plain_result(f"⏳ 正在{action}：{song.display_name}...")
                 )
-                song = await self.bilibili.download_audio(
-                    song, self.data_dir / "songs"
-                )
+                song = await self._download_song(song)
             else:
                 # 其他平台：HTTP 下载
                 if not song.audio_url:
@@ -1226,7 +1235,7 @@ class KookMusicPlugin(Star):
                 )
                 song = await self.downloader.download(song)
 
-            if not song.file_path:
+            if not song.playback_source:
                 await event.send(
                     event.plain_result(self._unplayable_message(song, download=True))
                 )

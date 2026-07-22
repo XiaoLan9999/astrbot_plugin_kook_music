@@ -40,6 +40,17 @@
         ],
         "default": "relay"
     },
+    "bili_stream_threshold_minutes": {
+        "description": "B站长视频流式阈值(分钟)",
+        "hint": "单个视频或分P达到该时长时，不等待完整下载，轮到播放前即时解析音频流。时长未知也会流式播放；设为 0 可禁用。",
+        "type": "int",
+        "slider": {
+            "min": 0,
+            "max": 1440,
+            "step": 10
+        },
+        "default": 30
+    },
     "max_queue_size": {
         "description": "最大播放队列长度",
         "hint": "每个服务器允许排队的最大歌曲数量",

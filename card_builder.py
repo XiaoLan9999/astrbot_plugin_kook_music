@@ -519,25 +519,21 @@ def build_bilibili_playing_card(
     modules.append({"type": "divider"})
 
     # 底部信息
-    context_elements = []
+    context_lines = []
     # B站链接
     video_url = _bilibili_video_url(song)
     if video_url:
-        context_elements.append({
-            "type": "kmarkdown",
-            "content": f"来源：**Bilibili** [查看视频]({video_url})"
-        })
+        context_lines.append(f"来源：**Bilibili** [查看视频]({video_url})")
     if song.requester_name:
-        context_elements.append({
-            "type": "kmarkdown",
-            "content": f"点歌：**{song.requester_name}**"
+        context_lines.append(f"点歌：**{song.requester_name}**")
+    context_lines.append(f"队列：**{queue_size}** 首 | 循环：**{loop_mode}**")
+    # KOOK 会把同一 context 的多个 element 横向挤在一行。每条信息使用
+    # 独立模块，长标题、点歌人和队列状态不会再互相覆盖。
+    for content in context_lines:
+        modules.append({
+            "type": "context",
+            "elements": [{"type": "kmarkdown", "content": content}],
         })
-    context_elements.append({
-        "type": "kmarkdown",
-        "content": f"队列：**{queue_size}** 首 | 循环：**{loop_mode}**"
-    })
-    if context_elements:
-        modules.append({"type": "context", "elements": context_elements})
 
     _append_watermark(modules)
 

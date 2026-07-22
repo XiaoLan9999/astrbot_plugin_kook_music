@@ -111,6 +111,26 @@ class BilibiliInputParsingTests(unittest.TestCase):
             "",
         )
 
+    def test_stream_url_rejects_local_and_numeric_host_spellings(self):
+        rejected = (
+            "https://localhost/audio.m4s",
+            "https://foo.localhost/audio.m4s",
+            "https://2130706433/audio.m4s",
+            "https://0x7f000001/audio.m4s",
+            "https://127.0.0.1/audio.m4s",
+            "https://cdn.example.test/audio.m4s\n-injected",
+        )
+        for value in rejected:
+            with self.subTest(value=value):
+                self.assertEqual(BilibiliExtractor._safe_stream_url(value), "")
+
+        self.assertEqual(
+            BilibiliExtractor._safe_stream_url(
+                "https://upos.example.test/audio.m4s?token=signed"
+            ),
+            "https://upos.example.test/audio.m4s?token=signed",
+        )
+
 
 class BilibiliCollectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_official_short_link_is_expanded_with_redirect_allowlist(self):
@@ -197,6 +217,126 @@ class BilibiliCollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured_urls, [expected])
         self.assertEqual(result.audio_url, expected)
 
+    async def test_prepare_audio_streams_long_media_without_downloading(self):
+        extractor = BilibiliExtractor()
+        song = Song(
+            id=f"{BVID_ONE}_p2",
+            name="Three hour mix",
+            duration=3 * 60 * 60 * 1000,
+            platform="bilibili",
+            provider_data={"bvid": BVID_ONE, "page": 2},
+        )
+        stream_url = "https://cdn.example.test/audio.m4s?token=secret"
+
+        async def resolve_stream(prepared_song):
+            prepared_song.stream_url = stream_url
+            prepared_song.extra_headers = {
+                "Referer": "https://www.bilibili.com/"
+            }
+            return prepared_song
+
+        extractor.resolve_audio_stream = AsyncMock(side_effect=resolve_stream)
+        extractor.download_audio = AsyncMock()
+
+        result = await extractor.prepare_audio(song, Path("unused"), 30)
+
+        self.assertEqual(result.playback_source, stream_url)
+        extractor.resolve_audio_stream.assert_awaited_once_with(song)
+        extractor.download_audio.assert_not_awaited()
+
+    async def test_prepare_audio_downloads_short_media_and_can_disable_streaming(self):
+        for duration, threshold in ((5 * 60 * 1000, 30), (0, 0)):
+            with self.subTest(duration=duration, threshold=threshold):
+                extractor = BilibiliExtractor()
+                song = Song(
+                    id=BVID_ONE,
+                    name="Short part",
+                    duration=duration,
+                    platform="bilibili",
+                    provider_data={"bvid": BVID_ONE, "page": 1},
+                )
+
+                async def download(prepared_song, _cache_dir):
+                    prepared_song.file_path = "cache/short.m4a"
+                    return prepared_song
+
+                extractor.resolve_audio_stream = AsyncMock()
+                extractor.download_audio = AsyncMock(side_effect=download)
+
+                result = await extractor.prepare_audio(song, Path("cache"), threshold)
+
+                self.assertEqual(result.playback_source, "cache/short.m4a")
+                extractor.resolve_audio_stream.assert_not_awaited()
+                extractor.download_audio.assert_awaited_once_with(song, Path("cache"))
+
+    async def test_resolve_stream_uses_exact_part_and_refreshes_missing_metadata(self):
+        extractor = BilibiliExtractor()
+        stream_url = "https://cdn.example.test/audio.m4s?token=secret"
+        extractor._yt_resolve_audio_stream = Mock(return_value={
+            "url": stream_url,
+            "http_headers": {
+                "User-Agent": "test-agent",
+                "Referer": "https://www.bilibili.com/video/",
+                "Cookie": "SESSDATA=must-not-leak",
+                "Authorization": "must-not-leak",
+            },
+            "title": "Resolved title",
+            "uploader": "Resolved uploader",
+            "duration": 10800,
+            "thumbnail": "http://images.example.test/cover.jpg",
+        })
+        song = Song(
+            id=f"{BVID_ONE}_p2",
+            name="未知视频",
+            artists="未知UP主",
+            platform="bilibili",
+            provider_data={"bvid": BVID_ONE, "page": 2},
+        )
+
+        result = await extractor.resolve_audio_stream(song)
+
+        extractor._yt_resolve_audio_stream.assert_called_once_with(
+            f"https://www.bilibili.com/video/{BVID_ONE}?p=2"
+        )
+        self.assertEqual(result.stream_url, stream_url)
+        self.assertEqual(result.name, "Resolved title")
+        self.assertEqual(result.artists, "Resolved uploader")
+        self.assertEqual(result.duration, 3 * 60 * 60 * 1000)
+        self.assertEqual(
+            result.cover_url,
+            "https://images.example.test/cover.jpg",
+        )
+        self.assertEqual(
+            result.extra_headers,
+            {
+                "User-Agent": "test-agent",
+                "Referer": "https://www.bilibili.com/video/",
+            },
+        )
+
+    async def test_prepare_audio_falls_back_to_download_when_stream_resolution_fails(self):
+        extractor = BilibiliExtractor()
+        song = Song(
+            id=BVID_ONE,
+            name="Long media",
+            duration=2 * 60 * 60 * 1000,
+            platform="bilibili",
+            provider_data={"bvid": BVID_ONE, "page": 1},
+        )
+        extractor.resolve_audio_stream = AsyncMock(return_value=song)
+
+        async def download(prepared_song, _cache_dir):
+            prepared_song.file_path = "cache/fallback.m4a"
+            return prepared_song
+
+        extractor.download_audio = AsyncMock(side_effect=download)
+
+        result = await extractor.prepare_audio(song, Path("cache"), 30)
+
+        self.assertEqual(result.playback_source, "cache/fallback.m4a")
+        extractor.resolve_audio_stream.assert_awaited_once_with(song)
+        extractor.download_audio.assert_awaited_once_with(song, Path("cache"))
+
     async def test_official_search_api_falls_back_before_yt_dlp_search(self):
         extractor = BilibiliExtractor()
         extractor._api_get_json = AsyncMock(return_value={
@@ -265,6 +405,21 @@ class BilibiliCollectionTests(unittest.IsolatedAsyncioTestCase):
             [song.provider_data["page"] for song in collection.songs],
             [1, 2, 3],
         )
+
+    async def test_large_multi_part_video_is_not_collapsed_to_first_part(self):
+        extractor = BilibiliExtractor()
+        extractor._fetch_video_view = AsyncMock(return_value=make_view(100))
+
+        collection = await extractor.extract_collection(
+            f"https://www.bilibili.com/video/{BVID_ONE}/"
+        )
+
+        self.assertIsNotNone(collection)
+        self.assertEqual(len(collection.songs), 100)
+        self.assertEqual(collection.songs[0].id, f"{BVID_ONE}_p1")
+        self.assertEqual(collection.songs[-1].id, f"{BVID_ONE}_p100")
+        self.assertEqual(collection.songs[0].duration, 10_000)
+        self.assertEqual(collection.songs[-1].duration, 1_000_000)
 
     async def test_explicit_page_is_a_single_song_not_a_collection(self):
         extractor = BilibiliExtractor()
@@ -461,6 +616,45 @@ class BilibiliYtDlpOptionTests(unittest.TestCase):
             str(card),
         )
         self.assertNotIn(f"{BVID_ONE}_p3/", str(card))
+
+    def test_bilibili_card_does_not_pack_business_context_into_three_columns(self):
+        song = Song(
+            id=f"{BVID_ONE}_p1",
+            name="Three hour mix",
+            artists="Example uploader",
+            duration=3 * 60 * 60 * 1000,
+            cover_url="https://images.example.test/cover.jpg",
+            platform="bilibili",
+            requester_name="tester",
+            provider_data={"bvid": BVID_ONE, "page": 1},
+        )
+
+        card = card_builder.build_bilibili_playing_card(
+            song,
+            queue_size=12,
+            loop_mode="关闭",
+        )
+
+        contexts = [
+            module
+            for module in card["modules"]
+            if module.get("type") == "context"
+            and "Powered By" not in str(module)
+        ]
+        self.assertTrue(contexts)
+        self.assertTrue(
+            all(len(module.get("elements", [])) <= 1 for module in contexts)
+        )
+        rendered_context = " ".join(str(module) for module in contexts)
+        self.assertIn("查看视频", rendered_context)
+        self.assertIn("tester", rendered_context)
+        self.assertIn("12", rendered_context)
+        self.assertIn("关闭", rendered_context)
+
+        rendered_card = str(card)
+        self.assertIn("Example uploader", rendered_card)
+        self.assertIn("3:00:00", rendered_card)
+        self.assertIn("https://images.example.test/cover.jpg", rendered_card)
 
 
 if __name__ == "__main__":

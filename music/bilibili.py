@@ -1,6 +1,7 @@
 """Bilibili 视频、分P与收藏夹音频提取模块。"""
 
 import asyncio
+import ipaddress
 import logging
 import random
 import re
@@ -333,6 +334,71 @@ class BilibiliExtractor:
         elif url.startswith("//"):
             url = "https:" + url
         return url if urlparse(url).scheme == "https" else ""
+
+    @classmethod
+    def _safe_stream_url(cls, value: object) -> str:
+        """只接受 yt-dlp 从官方页面解析出的公网 HTTPS 音频地址。"""
+        url = str(value or "").strip()
+        if any(ord(char) < 32 or ord(char) == 127 for char in url):
+            return ""
+        try:
+            parsed = urlparse(url)
+            hostname = (parsed.hostname or "").rstrip(".").lower()
+            port = parsed.port
+        except ValueError:
+            return ""
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in {None, 443}
+            or hostname == "localhost"
+            or hostname.endswith((".localhost", ".local"))
+        ):
+            return ""
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            address = None
+            labels = hostname.split(".")
+            if labels and all(
+                re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", label, re.IGNORECASE)
+                for label in labels
+            ):
+                return ""
+        if address is not None and not address.is_global:
+            return ""
+        return url
+
+    @classmethod
+    def _safe_stream_headers(cls, value: object) -> dict[str, str]:
+        """保留 B站 CDN 必需的非敏感请求头，不把 Cookie 交给 FFmpeg。"""
+        raw_headers = value if isinstance(value, dict) else {}
+        lowered = {
+            str(name).lower(): str(header_value)
+            for name, header_value in raw_headers.items()
+        }
+
+        def clean(name: str, fallback: str) -> str:
+            header_value = lowered.get(name.lower(), fallback).strip()
+            if (
+                not header_value
+                or len(header_value) > 1024
+                or any(char in header_value for char in "\r\n\0")
+            ):
+                return fallback
+            return header_value
+
+        user_agent = clean("user-agent", cls.API_HEADERS["User-Agent"])
+        referer = clean("referer", cls.API_HEADERS["Referer"])
+        parsed_referer = urlparse(referer)
+        if (
+            parsed_referer.scheme != "https"
+            or not cls._is_bilibili_host(parsed_referer.hostname or "")
+        ):
+            referer = cls.API_HEADERS["Referer"]
+        return {"User-Agent": user_agent, "Referer": referer}
 
     @staticmethod
     def _safe_int(value: object, default: int = 0) -> int:
@@ -699,6 +765,9 @@ class BilibiliExtractor:
         opts = {
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 20,
+            "retries": 3,
+            "fragment_retries": 3,
         }
         if self._ffmpeg_path:
             opts["ffmpeg_location"] = self._ffmpeg_path
@@ -889,6 +958,117 @@ class BilibiliExtractor:
             logger.warning(f"[KookMusic] yt-dlp extract_info 异常: {e}")
             return None
 
+    @staticmethod
+    def should_stream_audio(song: Song, threshold_minutes: int) -> bool:
+        """未知时长或超过阈值的单个视频使用即时流式播放。"""
+        if threshold_minutes <= 0:
+            return False
+        threshold_ms = threshold_minutes * 60 * 1000
+        return song.duration <= 0 or song.duration >= threshold_ms
+
+    def _video_url_from_song(self, song: Song) -> str:
+        bvid = str(song.provider_data.get("bvid", "") or "")
+        if not bvid:
+            match = re.match(r"^(BV[A-Za-z0-9]{10})", song.id or "", re.IGNORECASE)
+            bvid = match.group(1) if match else ""
+        if not re.fullmatch(r"BV[A-Za-z0-9]{10}", bvid, re.IGNORECASE):
+            return ""
+        page = self._safe_int(song.provider_data.get("page"), 1)
+        if page < 1:
+            return ""
+        return self._build_url(bvid, page, include_page=True)
+
+    async def prepare_audio(
+        self,
+        song: Song,
+        cache_dir: Path,
+        stream_threshold_minutes: int,
+    ) -> Song:
+        """按单个分P时长选择即时 HTTPS 流或完整本地下载。"""
+        if song.playback_source:
+            return song
+        if self.should_stream_audio(song, stream_threshold_minutes):
+            song = await self.resolve_audio_stream(song)
+            if song.stream_url:
+                return song
+            logger.warning(
+                f"[KookMusic] B站流地址解析失败，回退到完整下载: {song.name}"
+            )
+        return await self.download_audio(song, cache_dir)
+
+    async def resolve_audio_stream(self, song: Song) -> Song:
+        """在歌曲即将播放时解析一次短期有效的 B站音频 CDN 地址。"""
+        url = self._video_url_from_song(song)
+        song.stream_url = ""
+        if not url:
+            logger.error(f"[KookMusic] B站流解析缺少有效 BVID 或分P: {song.id}")
+            return song
+        song.audio_url = url
+
+        payload: dict = {}
+        for attempt in range(2):
+            try:
+                payload = await asyncio.to_thread(self._yt_resolve_audio_stream, url)
+            except Exception as e:
+                logger.warning(
+                    f"[KookMusic] B站流地址解析异常（第 {attempt + 1}/2 次）: {e}"
+                )
+                payload = {}
+            stream_url = self._safe_stream_url(payload.get("url"))
+            if stream_url:
+                song.stream_url = stream_url
+                song.extra_headers = self._safe_stream_headers(payload.get("http_headers"))
+                if not song.name or song.name == "未知视频":
+                    song.name = str(payload.get("title", "") or song.name)
+                if not song.artists or song.artists == "未知UP主":
+                    song.artists = str(
+                        payload.get("uploader", "")
+                        or payload.get("channel", "")
+                        or song.artists
+                    )
+                if song.duration <= 0:
+                    try:
+                        song.duration = max(
+                            0,
+                            int(float(payload.get("duration") or 0) * 1000),
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                if not song.cover_url:
+                    song.cover_url = self._https_url(payload.get("thumbnail"))
+                logger.info(
+                    f"[KookMusic] B站音频流已就绪: {song.display_name}"
+                )
+                return song
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+
+        song.extra_headers = {}
+        logger.error(f"[KookMusic] 无法获取安全的 B站 HTTPS 音频流: {song.name}")
+        return song
+
+    def _yt_resolve_audio_stream(self, url: str) -> dict:
+        """同步调用 yt-dlp 选择一条纯音频流，不下载媒体文件。"""
+        opts = self._base_ydl_opts()
+        opts.update({
+            "format": "ba[ext=m4a]/ba/b",
+            "skip_download": True,
+            "noplaylist": True,
+        })
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not isinstance(info, dict):
+            return {}
+        return {
+            "url": info.get("url", ""),
+            "http_headers": info.get("http_headers", {}),
+            "title": info.get("title", ""),
+            "uploader": info.get("uploader", ""),
+            "channel": info.get("channel", ""),
+            "duration": info.get("duration", 0),
+            "thumbnail": info.get("thumbnail", ""),
+        }
+
     async def download_audio(self, song: Song, cache_dir: Path) -> Song:
         """使用 yt-dlp 下载B站视频音频到本地。
 
@@ -899,20 +1079,13 @@ class BilibiliExtractor:
         Returns:
             更新了 file_path 的 Song 对象
         """
-        bvid = str(song.provider_data.get("bvid", "") or "")
-        if not bvid:
-            match = re.match(r"^(BV[A-Za-z0-9]{10})", song.id or "", re.IGNORECASE)
-            bvid = match.group(1) if match else ""
-        if not re.fullmatch(r"BV[A-Za-z0-9]{10}", bvid, re.IGNORECASE):
+        url = self._video_url_from_song(song)
+        if not url:
             logger.error(f"[KookMusic] B站下载缺少有效 BVID: {song.id}")
             song.file_path = ""
             return song
-        page = self._safe_int(song.provider_data.get("page"), 1)
-        if page < 1:
-            logger.error(f"[KookMusic] B站下载缺少有效分P页码: {song.id}")
-            song.file_path = ""
-            return song
-        url = self._build_url(bvid, page, include_page=True)
+        song.stream_url = ""
+        song.extra_headers = {}
         song.audio_url = url
         cache_dir.mkdir(parents=True, exist_ok=True)
         output_base = str(cache_dir / uuid.uuid4().hex)

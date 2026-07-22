@@ -13,11 +13,84 @@ RelayFFmpegPlayer 架构（借鉴 KO-ON-Bot）：
 """
 import asyncio
 import logging
+import re
 import socket
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 logger = logging.getLogger("astrbot")
+_HTTPS_URL_PATTERN = re.compile(r"https://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _is_https_source(source: str) -> bool:
+    try:
+        parsed = urlparse(source)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+def _source_exists(source: str) -> bool:
+    if source.lower().startswith(("http://", "https://")):
+        return _is_https_source(source)
+    return Path(source).exists()
+
+
+def _source_label(source: str) -> str:
+    """返回不会泄漏 CDN 签名参数的日志标签。"""
+    if _is_https_source(source):
+        return f"https://{urlparse(source).hostname}/<signed-audio>"
+    return Path(source).name
+
+
+def _redact_signed_urls(text: str) -> str:
+    """FFmpeg 错误有时会回显完整输入 URL，日志中统一去除。"""
+    return _HTTPS_URL_PATTERN.sub("https://<redacted>/<signed-audio>", text)
+
+
+def _http_input_args(
+    source: str,
+    extra_headers: dict | None,
+    start_seconds: float = 0.0,
+) -> list[str]:
+    if not _is_https_source(source):
+        args = []
+        if start_seconds > 0:
+            args.extend(["-ss", f"{start_seconds:.3f}"])
+        args.extend(["-i", source])
+        return args
+
+    # B站 CDN 需要 Referer 与 User-Agent。只允许这两个非敏感头，Cookie、
+    # Authorization 等登录信息不会进入 FFmpeg 命令行或被转发给 CDN。
+    lowered = {
+        str(name).lower(): str(value)
+        for name, value in (extra_headers or {}).items()
+    }
+    header_lines = []
+    for name in ("User-Agent", "Referer"):
+        value = lowered.get(name.lower(), "").strip()
+        if value and len(value) <= 1024 and not any(
+            char in value for char in "\r\n\0"
+        ):
+            header_lines.append(f"{name}: {value}")
+
+    args = [
+        "-rw_timeout", "15000000",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+    ]
+    if header_lines:
+        args.extend(["-headers", "\r\n".join(header_lines) + "\r\n"])
+    if start_seconds > 0:
+        args.extend(["-ss", f"{start_seconds:.3f}"])
+    args.extend(["-i", source])
+    return args
 
 
 class DirectFFmpegPlayer:
@@ -37,10 +110,17 @@ class DirectFFmpegPlayer:
     def is_playing(self) -> bool:
         return self._process is not None and self._process.returncode is None
 
-    async def play(self, file_path: str, rtp_url: str, ssrc: int) -> bool:
+    async def play(
+        self,
+        file_path: str,
+        rtp_url: str,
+        ssrc: int,
+        extra_headers: dict | None = None,
+        start_seconds: float = 0.0,
+    ) -> bool:
         await self.stop()
-        if not Path(file_path).exists():
-            logger.error(f"[KookMusic] 音频文件不存在: {file_path}")
+        if not _source_exists(file_path):
+            logger.error(f"[KookMusic] 音频播放源无效: {_source_label(file_path)}")
             return False
         self._current_file = file_path
 
@@ -54,10 +134,11 @@ class DirectFFmpegPlayer:
         # 构建 FFmpeg 命令
         cmd = [
             self.ffmpeg_path,
+            "-nostdin",
             "-re",
             "-nostats",
             "-loglevel", "warning",
-            "-i", file_path,
+            *_http_input_args(file_path, extra_headers, start_seconds),
             "-map", "0:a",
             "-acodec", "libopus",
             "-ab", "128k",
@@ -70,8 +151,10 @@ class DirectFFmpegPlayer:
             f"rtp://{rtp_host}:{rtp_port}?rtcpport={rtcp_port}",
         ]
 
-        cmd_str = " ".join(f'"{c}"' if " " in c or "?" in c else c for c in cmd)
-        logger.info(f"[KookMusic] FFmpeg 启动: {cmd_str[:200]}...")
+        logger.info(
+            f"[KookMusic] FFmpeg 启动: source={_source_label(file_path)}, "
+            f"rtp={rtp_host}:{rtp_port}"
+        )
 
         try:
             self._process = await asyncio.create_subprocess_exec(
@@ -91,7 +174,7 @@ class DirectFFmpegPlayer:
                 exit_code = self._process.returncode
                 logger.error(
                     f"[KookMusic] FFmpeg 提前退出 (exit={exit_code}): "
-                    f"{stderr_text[:500]}"
+                    f"{_redact_signed_urls(stderr_text)[:500]}"
                 )
                 self._process = None
                 return False
@@ -123,7 +206,7 @@ class DirectFFmpegPlayer:
             async for line in stderr_stream:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
-                    logger.debug(f"[KookMusic] FFmpeg: {text}")
+                    logger.debug(f"[KookMusic] FFmpeg: {_redact_signed_urls(text)}")
         except Exception:
             pass
 
@@ -195,6 +278,7 @@ class RelayFFmpegPlayer:
         self._song_done.set()  # 初始为已完成状态
         # 歌曲完成监控任务
         self._song_monitor: asyncio.Task | None = None
+        self._song_exit_code: int | None = None
         self._current_file: str = ""
         # UDP 中继端口
         self._udp_port: int = 0
@@ -290,7 +374,8 @@ class RelayFFmpegPlayer:
                 stderr_text = stderr_data.decode("utf-8", errors="replace") if stderr_data else ""
                 logger.error(
                     f"[KookMusic] 中继进程提前退出 "
-                    f"(exit={self._relay.returncode}): {stderr_text[:500]}"
+                    f"(exit={self._relay.returncode}): "
+                    f"{_redact_signed_urls(stderr_text)[:500]}"
                 )
                 self._relay = None
                 return False
@@ -316,7 +401,12 @@ class RelayFFmpegPlayer:
             return False
 
     async def play(
-        self, file_path: str, rtp_url: str = "", ssrc: int = 0
+        self,
+        file_path: str,
+        rtp_url: str = "",
+        ssrc: int = 0,
+        extra_headers: dict | None = None,
+        start_seconds: float = 0.0,
     ) -> bool:
         """播放一首歌（启动歌曲进程将音频通过 UDP 推入中继）。
 
@@ -331,25 +421,32 @@ class RelayFFmpegPlayer:
             logger.error("[KookMusic] 中继进程未运行，无法播放")
             return False
 
-        if not Path(file_path).exists():
-            logger.error(f"[KookMusic] 音频文件不存在: {file_path}")
+        if not _source_exists(file_path):
+            logger.error(f"[KookMusic] 音频播放源无效: {_source_label(file_path)}")
             return False
 
-        return await self._try_start_song(file_path)
+        return await self._try_start_song(file_path, extra_headers, start_seconds)
 
-    async def _try_start_song(self, file_path: str) -> bool:
+    async def _try_start_song(
+        self,
+        file_path: str,
+        extra_headers: dict | None = None,
+        start_seconds: float = 0.0,
+    ) -> bool:
         """尝试启动歌曲进程（单次尝试）"""
         self._current_file = file_path
         self._song_done.clear()
+        self._song_exit_code = None
 
         # 歌曲进程命令：读取音频 → 编码为 Opus（含音量调整）→ 通过 UDP 推入中继
         # -re 保证按实时速率推流（因为输入文件有时间戳）
         cmd = [
             self.ffmpeg_path,
+            "-nostdin",
             "-re",
             "-nostats",
             "-loglevel", "warning",
-            "-i", file_path,
+            *_http_input_args(file_path, extra_headers, start_seconds),
             "-acodec", "libopus",
             "-ab", "128k",
             "-filter:a", f"volume={self.volume}",
@@ -359,7 +456,7 @@ class RelayFFmpegPlayer:
             f"udp://127.0.0.1:{self._udp_port}?pkt_size=1316",
         ]
 
-        logger.info(f"[KookMusic] 歌曲进程启动: {Path(file_path).name}")
+        logger.info(f"[KookMusic] 歌曲进程启动: {_source_label(file_path)}")
 
         try:
             self._song_proc = await asyncio.create_subprocess_exec(
@@ -375,7 +472,10 @@ class RelayFFmpegPlayer:
                 if self._song_proc.stderr:
                     stderr_data = await self._song_proc.stderr.read()
                 stderr_text = stderr_data.decode("utf-8", errors="replace") if stderr_data else ""
-                logger.error(f"[KookMusic] 歌曲进程提前退出: {stderr_text[:300]}")
+                logger.error(
+                    f"[KookMusic] 歌曲进程提前退出: "
+                    f"{_redact_signed_urls(stderr_text)[:300]}"
+                )
                 self._song_proc = None
                 self._song_done.set()
                 return False
@@ -406,8 +506,11 @@ class RelayFFmpegPlayer:
     async def _monitor_song(self):
         """监控歌曲进程，结束时设置 _song_done 事件"""
         try:
-            if self._song_proc:
-                await self._song_proc.wait()
+            process = self._song_proc
+            if process:
+                exit_code = await process.wait()
+                if self._song_proc is process:
+                    self._song_exit_code = exit_code
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -442,6 +545,7 @@ class RelayFFmpegPlayer:
             self._song_proc = None
 
         self._current_file = ""
+        self._song_exit_code = None
         self._song_done.set()
 
 
@@ -488,7 +592,7 @@ class RelayFFmpegPlayer:
                     return False
             else:
                 await self._song_done.wait()
-            return True
+            return self._song_exit_code == 0
         except Exception:
             return False
 
@@ -502,7 +606,7 @@ class RelayFFmpegPlayer:
             async for line in stderr_stream:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
-                    logger.debug(f"[KookMusic] 中继: {text}")
+                    logger.debug(f"[KookMusic] 中继: {_redact_signed_urls(text)}")
         except Exception:
             pass
 
@@ -516,7 +620,7 @@ class RelayFFmpegPlayer:
             async for line in stderr_stream:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
-                    logger.debug(f"[KookMusic] 歌曲: {text}")
+                    logger.debug(f"[KookMusic] 歌曲: {_redact_signed_urls(text)}")
         except Exception:
             pass
 
