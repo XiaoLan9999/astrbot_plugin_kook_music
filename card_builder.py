@@ -2,6 +2,7 @@
 KOOK 卡片消息构建器。
 使用 AstrBot 内置的 KOOK 卡片消息类型构建精美的播放信息。
 """
+import re
 import time
 
 from .music.model import Song
@@ -21,6 +22,10 @@ _PLATFORM_LABELS = {
 
 def _platform_label(platform: str) -> str:
     return _PLATFORM_LABELS.get(platform, platform or "未知")
+
+
+def _escape_kmarkdown(text: str) -> str:
+    return re.sub(r"([\\`*~\[\]()])", r"\\\1", text)
 
 
 def _append_watermark(modules: list[dict]):
@@ -391,6 +396,88 @@ def build_import_result_card(
     return card
 
 
+def build_bilibili_collection_result_card(
+    total: int,
+    collection_id: str,
+    collection_title: str,
+    collection_kind: str,
+    queue_size: int = 0,
+    requester_name: str = "",
+    skipped: int = 0,
+) -> dict:
+    """构建 B站收藏夹或多P视频批量添加结果卡片。"""
+    title = collection_title.replace("\r", " ").replace("\n", " ").strip()
+    if len(title) > 120:
+        title = title[:117] + "..."
+
+    info_parts = [
+        f"**类型：** B站{collection_kind}",
+        f"**已添加：** {total} 项",
+        f"**队列总数：** {queue_size} 项",
+    ]
+    if skipped:
+        info_parts.append(f"**已跳过：** {skipped} 项")
+
+    modules = [
+        {
+            "type": "header",
+            "text": {"type": "plain-text", "content": "📥 B站批量添加完成"},
+        },
+        {
+            "type": "section",
+            "text": {"type": "kmarkdown", "content": "  |  ".join(info_parts)},
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "kmarkdown",
+                "content": f"**标题：** {_escape_kmarkdown(title or collection_id)}",
+            },
+        },
+        {"type": "divider"},
+    ]
+    context_elements = [
+        {
+            "type": "kmarkdown",
+            "content": f"{collection_kind} ID：**{collection_id}**",
+        }
+    ]
+    if requester_name:
+        context_elements.append({
+            "type": "kmarkdown",
+            "content": f"操作人：**{requester_name}**",
+        })
+    modules.append({"type": "context", "elements": context_elements})
+    _append_watermark(modules)
+    return {
+        "type": "card",
+        "theme": "success",
+        "size": "lg",
+        "color": "#FB7299",
+        "modules": modules,
+    }
+
+
+def _bilibili_video_url(song: Song) -> str:
+    bvid = str(song.provider_data.get("bvid", "") or "")
+    if not bvid:
+        match = re.match(r"^(BV[A-Za-z0-9]{10})", song.id or "", re.IGNORECASE)
+        bvid = match.group(1) if match else ""
+    if not re.fullmatch(r"BV[A-Za-z0-9]{10}", bvid, re.IGNORECASE):
+        return ""
+    raw_page = song.provider_data.get("page")
+    if raw_page is None:
+        page_match = re.search(r"_p(\d+)$", song.id or "", re.IGNORECASE)
+        raw_page = page_match.group(1) if page_match else 1
+    try:
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        return ""
+    if page < 1:
+        return ""
+    return f"https://www.bilibili.com/video/{bvid}?p={page}"
+
+
 def build_bilibili_playing_card(
     song: Song,
     queue_size: int = 0,
@@ -434,10 +521,11 @@ def build_bilibili_playing_card(
     # 底部信息
     context_elements = []
     # B站链接
-    if song.id:
+    video_url = _bilibili_video_url(song)
+    if video_url:
         context_elements.append({
             "type": "kmarkdown",
-            "content": f"来源：**Bilibili** [查看视频](https://www.bilibili.com/video/{song.id}/)"
+            "content": f"来源：**Bilibili** [查看视频]({video_url})"
         })
     if song.requester_name:
         context_elements.append({

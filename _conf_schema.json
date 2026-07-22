@@ -115,7 +115,7 @@
     },
     "bili_cookie": {
         "description": "B站 Cookie",
-        "hint": "填入B站登录后的 Cookie（SESSDATA 值即可），用于播放需要登录或有地区限制的B站视频。获取方法：浏览器登录B站后按 F12 → Application → Cookies → 复制 SESSDATA 的值。留空则不使用。",
+        "hint": "填入B站登录后的 Cookie（SESSDATA 值即可），用于播放需要登录或有地区限制的视频，以及读取账号有权限访问的私密收藏夹。获取方法：浏览器登录B站后按 F12 → Application → Cookies → 复制 SESSDATA 的值。留空则不使用。",
         "type": "string",
         "default": ""
     }

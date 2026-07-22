@@ -25,7 +25,7 @@ from .kook_voice.ffmpeg_installer import check_and_install_ffmpeg
 from .music.downloader import MusicDownloader
 from .music.model import Song
 from .music.searcher import MusicSearcher
-from .music.bilibili import BilibiliExtractor
+from .music.bilibili import BilibiliCollection, BilibiliExtractor
 from .music.playlist_import import PlaylistImporter
 from .playlist_range import looks_like_playlist_range, validate_playlist_range
 
@@ -37,6 +37,8 @@ _pending_selections_lock = asyncio.Lock()
 _pending_playlist_ranges: dict[str, tuple[list[Song], asyncio.Future]] = {}
 _pending_playlist_ranges_lock = asyncio.Lock()
 _playlist_import_requests: dict[str, object] = {}
+_bilibili_play_requests: dict[str, object] = {}
+_playlist_request_commit_lock = asyncio.Lock()
 
 # 已知的平台标识
 _KNOWN_PLATFORMS = {"netease", "qq", "kugou", "kuwo", "migu", "baidu", "bilibili"}
@@ -50,6 +52,7 @@ class KookMusicPlugin(Star):
 
     在 KOOK 平台实现语音频道点歌：
     - 点歌 <歌名> [平台] — 搜索并播放
+    - 播放 <关键词/BV号/链接> — 播放 B站视频、多P或收藏夹
     - 下一首 — 跳过当前
     - 歌单 — 查看队列
     - 循环模式 — 切换循环
@@ -124,6 +127,7 @@ class KookMusicPlugin(Star):
         _pending_selections.clear()
         _pending_playlist_ranges.clear()
         _playlist_import_requests.clear()
+        _bilibili_play_requests.clear()
 
         self._kook_token = self._find_kook_token()
         if self._kook_token:
@@ -182,6 +186,7 @@ class KookMusicPlugin(Star):
                 future.cancel()
         _pending_playlist_ranges.clear()
         _playlist_import_requests.clear()
+        _bilibili_play_requests.clear()
         # 取消按钮处理循环
         if self._button_handler_task and not self._button_handler_task.done():
             self._button_handler_task.cancel()
@@ -712,9 +717,9 @@ class KookMusicPlugin(Star):
         ok, msg = await self.voice_manager.leave(guild_id)
         yield event.plain_result(f"{'✅' if ok else '❌'} {msg}")
 
-    @filter.command("播放b站")
-    async def on_play_bilibili(self, event: AstrMessageEvent):
-        """播放b站 <关键词/BV号/链接> — 播放B站视频音频"""
+    @filter.command("播放")
+    async def on_play_video(self, event: AstrMessageEvent):
+        """播放 <关键词/BV号/视频或收藏夹链接> — 播放视频音频"""
         if not self._is_kook(event):
             return
 
@@ -725,17 +730,22 @@ class KookMusicPlugin(Star):
                 return
 
         raw_text = event.message_str.strip()
-        for prefix in ("播放b站", "/播放b站", "播放B站", "/播放B站"):
+        for prefix in ("#播放", "/播放", "播放"):
             if raw_text.startswith(prefix):
                 raw_text = raw_text[len(prefix):].strip()
+                break
+        for legacy_prefix in ("b站", "B站"):
+            if raw_text.startswith(legacy_prefix):
+                raw_text = raw_text[len(legacy_prefix):].strip()
                 break
 
         if not raw_text:
             yield event.plain_result(
-                "用法：播放b站 <关键词/BV号/链接>\n"
-                "例如：播放b站 海阔天空\n"
-                "例如：播放b站 BV1qa411e7Fi\n"
-                "例如：播放b站 https://www.bilibili.com/video/BV1kT4y1X7UW?p=4"
+                "用法：播放 <关键词/BV号/视频链接/收藏夹链接>\n"
+                "例如：播放 海阔天空\n"
+                "例如：播放 BV1dujdzrEA4\n"
+                "例如：播放 https://www.bilibili.com/video/BV1dujdzrEA4?p=2\n"
+                "例如：播放 https://space.bilibili.com/84912/favlist?fid=213003412"
             )
             return
 
@@ -744,7 +754,54 @@ class KookMusicPlugin(Star):
             yield event.plain_result("❌ 无法获取服务器信息")
             return
 
-        await self._play_bilibili(event, raw_text, guild_id)
+        interaction_key = self._playlist_interaction_key(event, guild_id)
+        request_marker = object()
+        async with _playlist_request_commit_lock:
+            async with _pending_playlist_ranges_lock:
+                old_bili_marker = _bilibili_play_requests.get(interaction_key)
+                _bilibili_play_requests[interaction_key] = request_marker
+                if (
+                    old_bili_marker
+                    and _playlist_import_requests.get(interaction_key)
+                    is old_bili_marker
+                ):
+                    old_entry = _pending_playlist_ranges.pop(interaction_key, None)
+                    if old_entry and not old_entry[1].done():
+                        old_entry[1].cancel()
+                    _playlist_import_requests.pop(interaction_key, None)
+
+        try:
+            await event.send(event.plain_result(
+                f"🔍 正在解析视频内容：{raw_text}..."
+            ))
+            resolved_text = await self.bilibili.resolve_input(raw_text)
+            if not resolved_text:
+                await event.send(event.plain_result(
+                    "❌ B站短链展开失败或跳转目标不受支持"
+                ))
+                return
+            raw_text = resolved_text
+            collection = await self.bilibili.extract_collection(raw_text)
+            if collection:
+                await self._play_bilibili_collection(
+                    event,
+                    collection,
+                    guild_id,
+                    interaction_key,
+                    request_marker,
+                )
+                return
+            if self.bilibili.parse_favorite_input(raw_text):
+                await event.send(event.plain_result(
+                    "❌ 无法读取 B站收藏夹；请确认收藏夹公开，"
+                    "私密收藏夹需要在插件配置中填写有效的 bili_cookie"
+                ))
+                return
+            await self._play_bilibili(event, raw_text, guild_id)
+        finally:
+            async with _playlist_request_commit_lock:
+                if _bilibili_play_requests.get(interaction_key) is request_marker:
+                    _bilibili_play_requests.pop(interaction_key, None)
 
     @filter.command("导入歌单")
     async def on_import_playlist(self, event: AstrMessageEvent):
@@ -786,11 +843,12 @@ class KookMusicPlugin(Star):
         requester_name = event.get_sender_name()
         interaction_key = self._playlist_interaction_key(event, guild_id)
         request_marker = object()
-        async with _pending_playlist_ranges_lock:
-            old_entry = _pending_playlist_ranges.pop(interaction_key, None)
-            if old_entry and not old_entry[1].done():
-                old_entry[1].cancel()
-            _playlist_import_requests[interaction_key] = request_marker
+        async with _playlist_request_commit_lock:
+            async with _pending_playlist_ranges_lock:
+                old_entry = _pending_playlist_ranges.pop(interaction_key, None)
+                if old_entry and not old_entry[1].done():
+                    old_entry[1].cancel()
+                _playlist_import_requests[interaction_key] = request_marker
 
         # 官方链接自动识别平台；裸数字保持兼容，仍默认网易云。
         import_type, target_id = await self.playlist_importer.resolve_playlist_input(
@@ -920,13 +978,22 @@ class KookMusicPlugin(Star):
                 yield event.plain_result("❌ 请先加入一个语音频道再导入歌单")
                 return
 
-        ok, msg = await self.voice_manager.join_and_play_many(
-            self._kook_token,
-            guild_id,
-            voice_channel_id or "",
-            channel_id,
-            songs,
-        )
+        request_replaced = False
+        async with _playlist_request_commit_lock:
+            if _playlist_import_requests.get(interaction_key) is not request_marker:
+                request_replaced = True
+                ok, msg = False, "请求已被替换"
+            else:
+                ok, msg = await self.voice_manager.join_and_play_many(
+                    self._kook_token,
+                    guild_id,
+                    voice_channel_id or "",
+                    channel_id,
+                    songs,
+                )
+        if request_replaced:
+            yield event.plain_result("ℹ️ 本次导入已由更新的批量请求替换")
+            return
         if not ok:
             self._finish_playlist_import_request(interaction_key, request_marker)
             yield event.plain_result(f"❌ {msg}，请重新导入并选择更短的区间")
@@ -1219,11 +1286,6 @@ class KookMusicPlugin(Star):
         self, event: AstrMessageEvent, keyword: str, guild_id: str
     ):
         """B站视频点歌流程"""
-        channel_id = self._get_channel_id(event)
-
-        # 解析提示
-        await event.send(event.plain_result(f"🔍 正在解析B站视频：{keyword}..."))
-
         # 提取视频音频
         song = await self.bilibili.extract(keyword)
         if not song:
@@ -1240,6 +1302,214 @@ class KookMusicPlugin(Star):
 
         # 复用现有播放流程
         await self._play_song(event, song, guild_id)
+
+    async def _play_bilibili_collection(
+        self,
+        event: AstrMessageEvent,
+        collection: BilibiliCollection,
+        guild_id: str,
+        interaction_key: str,
+        request_marker: object,
+    ):
+        """按歌单区间规则将 B站收藏夹或多P视频整批原子入队。"""
+        channel_id = self._get_channel_id(event)
+        requester_id = event.get_sender_id()
+        requester_name = event.get_sender_name()
+
+        request_replaced = False
+        async with _playlist_request_commit_lock:
+            if _bilibili_play_requests.get(interaction_key) is not request_marker:
+                request_replaced = True
+            else:
+                async with _pending_playlist_ranges_lock:
+                    old_entry = _pending_playlist_ranges.pop(interaction_key, None)
+                    if old_entry and not old_entry[1].done():
+                        old_entry[1].cancel()
+                    _playlist_import_requests[interaction_key] = request_marker
+        if request_replaced:
+            await event.send(event.plain_result(
+                "ℹ️ 本次添加已由更新的播放请求替换"
+            ))
+            return
+
+        try:
+            songs = list(collection.songs)
+            if not songs:
+                await event.send(event.plain_result(
+                    f"❌ B站{collection.kind}为空或没有可读取的视频"
+                ))
+                return
+
+            available_slots = self._available_queue_slots(guild_id)
+            if available_slots <= 0:
+                await event.send(event.plain_result(
+                    f"❌ 当前播放队列已满（上限 {self.max_queue_size} 首），"
+                    f"无法添加 B站{collection.kind}"
+                ))
+                return
+
+            if len(songs) > available_slots:
+                future = asyncio.get_running_loop().create_future()
+                async with _pending_playlist_ranges_lock:
+                    request_replaced = (
+                        _playlist_import_requests.get(interaction_key)
+                        is not request_marker
+                    )
+                    if not request_replaced:
+                        _pending_playlist_ranges[interaction_key] = (songs, future)
+                if request_replaced:
+                    await event.send(event.plain_result(
+                        "ℹ️ 本次添加已由更新的批量播放请求替换"
+                    ))
+                    return
+
+                title = (
+                    collection.title.replace("\r", " ").replace("\n", " ").strip()[:80]
+                )
+                await event.send(event.plain_result(
+                    f"📚 B站{collection.kind}《{title}》共有 {len(songs)} 项，"
+                    f"当前队列最多还能加入 {available_slots} 项。\n"
+                    f"请在 {self.playlist_range_timeout} 秒内输入要播放的区间，"
+                    f"例如 `1-{available_slots}`。\n"
+                    f"区间必须在 1-{len(songs)} 内，且数量不能超过 "
+                    f"{available_slots} 项。"
+                ))
+
+                try:
+                    songs = await asyncio.wait_for(
+                        future, timeout=self.playlist_range_timeout
+                    )
+                except asyncio.TimeoutError:
+                    await event.send(event.plain_result(
+                        "⏰ B站批量播放区间选择超时，本次添加已取消"
+                    ))
+                    return
+                except asyncio.CancelledError:
+                    if (
+                        _playlist_import_requests.get(interaction_key)
+                        is not request_marker
+                    ):
+                        await event.send(event.plain_result(
+                            "ℹ️ 已由新的批量播放请求替换本次区间选择"
+                        ))
+                        return
+                    raise
+                finally:
+                    async with _pending_playlist_ranges_lock:
+                        current = _pending_playlist_ranges.get(interaction_key)
+                        if current and current[1] is future:
+                            _pending_playlist_ranges.pop(interaction_key, None)
+
+            if _playlist_import_requests.get(interaction_key) is not request_marker:
+                await event.send(event.plain_result(
+                    "ℹ️ 本次添加已由更新的批量播放请求替换"
+                ))
+                return
+
+            available_slots = self._available_queue_slots(guild_id)
+            if len(songs) > available_slots:
+                await event.send(event.plain_result(
+                    f"❌ 等待期间队列发生变化，目前只能再加入 {available_slots} 项。"
+                    "请重新执行播放命令并选择更短的区间。"
+                ))
+                return
+
+            selected_count = len(songs)
+            materialized = await self.bilibili.materialize_collection_songs(songs)
+            if materialized is None:
+                await event.send(event.plain_result(
+                    f"❌ B站{collection.kind}内容读取失败，请稍后重试"
+                ))
+                return
+            songs = materialized
+            skipped = selected_count - len(songs)
+            if not songs:
+                await event.send(event.plain_result(
+                    "❌ 所选区间没有可播放的视频，内容可能已失效或被删除"
+                ))
+                return
+
+            if _playlist_import_requests.get(interaction_key) is not request_marker:
+                await event.send(event.plain_result(
+                    "ℹ️ 本次添加已由更新的批量播放请求替换"
+                ))
+                return
+
+            for song in songs:
+                song.requester_id = requester_id
+                song.requester_name = requester_name
+
+            available_slots = self._available_queue_slots(guild_id)
+            if len(songs) > available_slots:
+                await event.send(event.plain_result(
+                    f"❌ 读取期间队列发生变化，目前只能再加入 {available_slots} 项。"
+                    "请重新执行播放命令并选择更短的区间。"
+                ))
+                return
+
+            existing_session = self.voice_manager.get_session(guild_id)
+            if existing_session:
+                voice_channel_id = existing_session.voice_channel_id
+            else:
+                voice_channel_id = await self.voice_manager.get_user_voice_channel(
+                    self._kook_token, guild_id, requester_id
+                )
+                if not voice_channel_id and not self.voice_manager.get_session(guild_id):
+                    await event.send(event.plain_result(
+                        "❌ 请先加入一个语音频道再添加 B站内容"
+                    ))
+                    return
+
+            request_replaced = False
+            async with _playlist_request_commit_lock:
+                if (
+                    _bilibili_play_requests.get(interaction_key)
+                    is not request_marker
+                    or _playlist_import_requests.get(interaction_key)
+                    is not request_marker
+                ):
+                    request_replaced = True
+                    ok, msg = False, "请求已被替换"
+                else:
+                    ok, msg = await self.voice_manager.join_and_play_many(
+                        self._kook_token,
+                        guild_id,
+                        voice_channel_id or "",
+                        channel_id,
+                        songs,
+                    )
+            if request_replaced:
+                await event.send(event.plain_result(
+                    "ℹ️ 本次添加已由更新的播放或歌单请求替换"
+                ))
+                return
+            if not ok:
+                await event.send(event.plain_result(
+                    f"❌ {msg}，请重新执行播放命令并选择更短的区间"
+                ))
+                return
+
+            session = self.voice_manager.get_session(guild_id)
+            queue_size = len(session.playlist) if session else len(songs)
+            result_card = card_builder.build_bilibili_collection_result_card(
+                total=len(songs),
+                collection_id=collection.id,
+                collection_title=collection.title,
+                collection_kind=collection.kind,
+                queue_size=queue_size,
+                requester_name=requester_name,
+                skipped=skipped,
+            )
+            if self._kook_token and channel_id:
+                await send_card_message(self._kook_token, channel_id, result_card)
+            else:
+                await event.send(event.chain_result([Json(data=result_card)]))
+        finally:
+            async with _playlist_request_commit_lock:
+                self._finish_playlist_import_request(
+                    interaction_key,
+                    request_marker,
+                )
 
     async def _on_playback_finished(self, guild_id: str):
         """播放队列全部完成的回调"""
