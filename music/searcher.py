@@ -6,11 +6,12 @@ QQ 音乐与酷狗优先使用各自网页接口获取可播放的临时地址�
 """
 
 import asyncio
+import html
 import ipaddress
 import logging
 import re
 import uuid
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
 
@@ -50,7 +51,7 @@ PLATFORM_ALIASES: dict[str, str] = {
 }
 
 _QQ_SONG_PATH_PATTERN = re.compile(
-    r"/(?:n/)?(?:ryqq/songDetail|yqq/song)/([A-Za-z0-9]+)(?:\.html)?",
+    r"/(?:n/)?(?:ryqq(?:_v2)?/songDetail|yqq/song)/([A-Za-z0-9]+)(?:\.html)?(?:/|$)",
     re.IGNORECASE,
 )
 _KUGOU_HASH_PATTERN = re.compile(r"(?:^|[?&#])hash=([0-9a-f]{32})", re.IGNORECASE)
@@ -60,6 +61,23 @@ _KUGOU_PAGE_HASH_PATTERNS = (
 )
 
 
+class _QQResolverFailure(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        retry_after: float = 0.25,
+        user_reason: str = "",
+        source_failure: bool = True,
+    ):
+        super().__init__(message)
+        self.retryable = retryable
+        self.retry_after = retry_after
+        self.user_reason = user_reason
+        self.source_failure = source_failure
+
+
 class MusicSearcher:
     """多平台音乐搜索及临时播放地址解析器。"""
 
@@ -67,6 +85,10 @@ class MusicSearcher:
     METING_API_URL = "https://api.qijieya.cn/meting/"
     DEFAULT_QQ_VIP_RESOLVER_URL = "https://meting.mikus.ink/api"
     QQ_VIP_RESOLVER_QUALITIES = {"128", "320", "flac"}
+    QQ_VIP_RESOLVER_TIMEOUT = 15.0
+    QQ_VIP_RESOLVER_RETRY_DELAY = 0.25
+    QQ_VIP_RESOLVER_MAX_SOURCES = 4
+    QQ_VIP_RESOLVER_FAILURE_THRESHOLD = 2
 
     HEADERS = {
         "User-Agent": (
@@ -107,9 +129,43 @@ class MusicSearcher:
         self,
         qq_vip_resolver_url: str = "",
         qq_vip_resolver_quality: str = "320",
+        qq_vip_resolver_backups: list[str] | None = None,
+        qq_vip_resolver_cooldown_seconds: int = 60,
     ):
         self._session: aiohttp.ClientSession | None = None
+        self.account_resolver = None
         self.qq_vip_resolver_url = str(qq_vip_resolver_url or "").strip()
+        sources = []
+        seen = set()
+        if self.qq_vip_resolver_url:
+            backups = qq_vip_resolver_backups if isinstance(qq_vip_resolver_backups, list) else []
+            for value in [self.qq_vip_resolver_url, *backups]:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                url = value.strip()
+                try:
+                    parsed = urlparse(url)
+                    key = parsed._replace(
+                        scheme=parsed.scheme.lower(), netloc=parsed.netloc.lower(),
+                        path=parsed.path.rstrip("/"), fragment="",
+                    ).geturl()
+                except ValueError:
+                    key = url
+                if key not in seen:
+                    seen.add(key)
+                    sources.append(url)
+                    if len(sources) == self.QQ_VIP_RESOLVER_MAX_SOURCES:
+                        break
+        self._qq_resolver_urls = tuple(sources)
+        self.qq_vip_resolver_backups = sources[1:]
+        try:
+            self.qq_vip_resolver_cooldown_seconds = max(
+                0, min(int(qq_vip_resolver_cooldown_seconds), 3600)
+            )
+        except (TypeError, ValueError):
+            self.qq_vip_resolver_cooldown_seconds = 60
+        self._qq_resolver_failures: dict[str, int] = {}
+        self._qq_resolver_cooldowns: dict[str, float] = {}
         quality = str(qq_vip_resolver_quality or "320").strip().lower()
         self.qq_vip_resolver_quality = (
             quality if quality in self.QQ_VIP_RESOLVER_QUALITIES else "320"
@@ -229,7 +285,7 @@ class MusicSearcher:
         return self._parse_qq_search_songs(
             result,
             limit,
-            include_paid=bool(self.qq_vip_resolver_url),
+            include_paid=bool(self.qq_vip_resolver_url or self.account_resolver),
         )
 
     @classmethod
@@ -260,6 +316,15 @@ class MusicSearcher:
             if len(songs) >= limit:
                 break
         return songs
+
+    @staticmethod
+    def _qq_track_title(item: dict, default: str = "未知歌曲") -> str:
+        # QQ's name omits edition labels; title is the client-facing full title.
+        for key in ("title", "name", "songname"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return default
 
     @classmethod
     def _parse_qq_track(
@@ -306,12 +371,7 @@ class MusicSearcher:
             duration = 0
         return Song(
             id=song_id,
-            name=str(
-                item.get("name", "")
-                or item.get("title", "")
-                or item.get("songname", "")
-                or "未知歌曲"
-            ),
+            name=cls._qq_track_title(item),
             artists=artists or "未知歌手",
             duration=duration,
             cover_url=cover_url,
@@ -699,10 +759,13 @@ class MusicSearcher:
         if (
             song.provider_data.get("resolver_status") == "denied"
             and not (platform == "qq" and self.qq_vip_resolver_url)
+            and not (platform in {"qq", "netease"} and self.account_resolver)
         ):
             return song
 
         if platform == "netease" and song.id:
+            if await self._fill_account_audio(song):
+                return song
             song = await self._fetch_netease_audio_url(song)
             if song.audio_url:
                 return song
@@ -742,11 +805,17 @@ class MusicSearcher:
             if direct_song:
                 if direct_song.audio_url:
                     return direct_song
+                if await self._fill_account_audio(direct_song):
+                    return direct_song
                 if self.qq_vip_resolver_url:
                     await self._fill_qq_vip_resolver_url(direct_song)
                     if direct_song.audio_url:
                         return direct_song
-                if direct_song.provider_data.get("resolver_status") == "denied":
+                if (
+                    direct_song.provider_data.get("resolver_status") == "denied"
+                    or direct_song.provider_data.get("qq_vip_resolver_status")
+                    == "transient"
+                ):
                     return direct_song
             results = await self._search_via_aggregator(
                 song_id, platform, 5, filter_type="id"
@@ -756,6 +825,8 @@ class MusicSearcher:
                     result.id.casefold() == song_id.casefold()
                     and result.audio_url
                 ):
+                    if direct_song and direct_song.name:
+                        result.name = direct_song.name
                     return result
         elif platform == "kugou":
             direct_song = await self._fetch_kugou_song_by_id(song_id)
@@ -775,8 +846,39 @@ class MusicSearcher:
         if platform in self.METING_SERVERS:
             meting_song = await self._fetch_meting_song_by_id(platform, song_id)
             if meting_song:
+                if platform == "qq" and direct_song and direct_song.name:
+                    meting_song.name = direct_song.name
                 return meting_song
         return direct_song
+
+    async def _fill_account_audio(self, song: Song) -> bool:
+        if not self.account_resolver or song.platform not in {"qq", "netease"} or not song.id:
+            return False
+        try:
+            result = await asyncio.wait_for(self.account_resolver(song), timeout=12)
+            url = str(getattr(result, "url", "") or "")
+            if getattr(result, "status", "") != "resolved" or not url:
+                return False
+            valid = self._is_qq_audio_url(url) if song.platform == "qq" else self._is_netease_audio_url(url)
+            if not valid:
+                return False
+            song.audio_url = url
+            song.unplayable_reason = ""
+            song.provider_data["resolver_status"] = "resolved"
+            song.provider_data["account_audio"] = True
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[KookMusic] 自有账号取歌暂时不可用 (%s)", type(exc).__name__)
+            return False
+
+    @classmethod
+    def _is_netease_audio_url(cls, value: str) -> bool:
+        if not cls._is_http_url(value):
+            return False
+        parsed = urlparse(value)
+        return parsed.scheme.lower() == "https" and (parsed.hostname or "").lower().endswith(".music.126.net")
 
     async def _fetch_qq_song_by_id(self, song_id: str) -> Song | None:
         session = await self._get_session()
@@ -785,7 +887,11 @@ class MusicSearcher:
             "req_0": {
                 "module": "music.pf_song_detail_svr",
                 "method": "get_song_detail_yqq",
-                "param": {"song_mid": song_id},
+                "param": (
+                    {"song_id": int(song_id)}
+                    if re.fullmatch(r"[0-9]{1,20}", song_id)
+                    else {"song_mid": song_id}
+                ),
             },
         }
         try:
@@ -881,11 +987,192 @@ class MusicSearcher:
         )
 
     async def _fill_qq_vip_resolver_url(self, song: Song) -> bool:
-        """通过配置的同 ID 解析源补充 QQ 会员歌曲播放地址。"""
+        """在共享时间预算内依次尝试同 MID 解析源，不替换歌曲版本。"""
         if not self.qq_vip_resolver_url or not song.id:
             return False
 
-        resolver_path = urlparse(self.qq_vip_resolver_url).path.rstrip("/").lower()
+        song.provider_data.pop("qq_vip_resolver_status", None)
+        song.provider_data.pop("qq_vip_resolver_source_host", None)
+        song.provider_data.pop("qq_vip_resolver_source_index", None)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.QQ_VIP_RESOLVER_TIMEOUT
+        sources = [
+            (index, url) for index, url in enumerate(self._qq_resolver_urls, 1)
+            if self._qq_resolver_cooldowns.get(url, 0) <= loop.time()
+        ]
+        timed_out = False
+        failed = len(sources) < len(self._qq_resolver_urls)
+        failure_reason = (
+            "QQ 音乐解析服务暂时不可用，故障源正在冷却，请稍后重试"
+            if not sources else ""
+        )
+        for position, (source_index, resolver_url) in enumerate(sources):
+            host = self._qq_resolver_host(resolver_url)
+            # Prefer another source to waiting for a retry on a broken source.
+            attempts = 2 if len(sources) == 1 else 1
+            for attempt in range(attempts):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    timed_out = failed = True
+                    break
+                if attempts == 2 and attempt == 0:
+                    attempt_budget = min(
+                        remaining,
+                        max(0.001, (remaining - self.QQ_VIP_RESOLVER_RETRY_DELAY) / 2),
+                    )
+                else:
+                    attempt_budget = remaining / (len(sources) - position)
+                retryable = False
+                source_failure = False
+                retry_delay = self.QQ_VIP_RESOLVER_RETRY_DELAY
+                session = None
+                try:
+                    attempt_deadline = loop.time() + attempt_budget
+                    session = await asyncio.wait_for(
+                        self._get_session(), timeout=attempt_budget
+                    )
+                    audio_url = await asyncio.wait_for(
+                        self._request_qq_vip_resolver_url(
+                            session, song, attempt_deadline, resolver_url=resolver_url
+                        ),
+                        timeout=max(0.001, attempt_deadline - loop.time()),
+                    )
+                    self._qq_resolver_failures.pop(resolver_url, None)
+                    self._qq_resolver_cooldowns.pop(resolver_url, None)
+                    if not audio_url:
+                        break
+                    song.audio_url = audio_url
+                    song.unplayable_reason = ""
+                    song.provider_data["resolver_status"] = "resolved"
+                    song.provider_data["qq_vip_resolver_status"] = "resolved"
+                    song.provider_data["qq_vip_resolver_source_host"] = host
+                    song.provider_data["qq_vip_resolver_source_index"] = source_index
+                    logger.info(
+                        "[KookMusic] QQ音乐同MID解析成功 %s (source=%s host=%s)",
+                        song.id, source_index, host,
+                    )
+                    return True
+                except asyncio.CancelledError:
+                    raise
+                except (asyncio.TimeoutError, aiohttp.ClientError, _QQResolverFailure) as exc:
+                    failed = True
+                    timed_out = timed_out or isinstance(exc, asyncio.TimeoutError)
+                    if isinstance(exc, _QQResolverFailure):
+                        retryable = exc.retryable
+                        retry_delay = max(retry_delay, exc.retry_after)
+                        failure_reason = exc.user_reason
+                        source_failure = exc.source_failure
+                    else:
+                        retryable = isinstance(
+                            exc,
+                            (asyncio.TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError),
+                        ) and not isinstance(exc, aiohttp.ClientSSLError)
+                        source_failure = retryable
+                    if retryable and isinstance(exc, aiohttp.ClientConnectorError) and session:
+                        self._clear_qq_resolver_dns_cache(session, resolver_url=resolver_url)
+                    detail = (
+                        str(exc) if isinstance(exc, _QQResolverFailure)
+                        else f"errno={exc.os_error.errno}"
+                        if retryable and isinstance(exc, aiohttp.ClientConnectorError)
+                        else type(exc).__name__
+                    )
+                    logger.warning(
+                        "[KookMusic] QQ音乐解析源暂时不可用 %s: %s "
+                        "(source=%s host=%s attempt=%s)",
+                        song.id, detail, source_index, host, attempt + 1,
+                    )
+                except Exception as exc:
+                    failed = True
+                    logger.warning(
+                        "[KookMusic] QQ音乐解析源异常 %s: %s (source=%s host=%s)",
+                        song.id, type(exc).__name__, source_index, host,
+                    )
+                if source_failure:
+                    count = self._qq_resolver_failures.get(resolver_url, 0) + 1
+                    self._qq_resolver_failures[resolver_url] = count
+                    if count >= self.QQ_VIP_RESOLVER_FAILURE_THRESHOLD:
+                        self._qq_resolver_cooldowns[resolver_url] = (
+                            loop.time() + self.qq_vip_resolver_cooldown_seconds
+                        )
+                else:
+                    self._qq_resolver_failures.pop(resolver_url, None)
+                    self._qq_resolver_cooldowns.pop(resolver_url, None)
+                remaining = deadline - loop.time()
+                if not retryable or attempt + 1 == attempts or retry_delay >= remaining:
+                    break
+                await asyncio.sleep(retry_delay)
+
+        if not failed:
+            return False
+
+        song.provider_data["resolver_status"] = "transient"
+        song.provider_data["qq_vip_resolver_status"] = "transient"
+        song.unplayable_reason = failure_reason or (
+            "QQ 音乐解析服务暂时超时，请稍后重试"
+            if timed_out
+            else "QQ 音乐解析服务暂时不可用，请稍后重试"
+        )
+        return False
+
+    @staticmethod
+    def _qq_resolver_host(resolver_url: str) -> str:
+        try:
+            return urlparse(resolver_url).hostname or "invalid-host"
+        except ValueError:
+            return "invalid-host"
+
+    def _clear_qq_resolver_dns_cache(
+        self, session: aiohttp.ClientSession, resolver_url: str | None = None
+    ):
+        connector = getattr(session, "connector", None)
+        if connector is None or not hasattr(connector, "clear_dns_cache"):
+            return
+        try:
+            parsed = urlparse(resolver_url or self.qq_vip_resolver_url)
+            connector.clear_dns_cache(
+                parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+            )
+        except (KeyError, ValueError):
+            pass
+
+    @staticmethod
+    def _check_qq_resolver_status(resp, *, redirect: bool = False):
+        if resp.status == 200 and not redirect:
+            return
+        if redirect and 300 <= resp.status < 400:
+            return
+        retry_after = 0.25
+        if resp.status == 429:
+            try:
+                retry_after = max(retry_after, float(resp.headers.get("Retry-After", 0)))
+            except (TypeError, ValueError):
+                pass
+        raise _QQResolverFailure(
+            f"HTTP {resp.status}",
+            retryable=resp.status == 429 or resp.status >= 500 or resp.status == 200,
+            retry_after=retry_after,
+            user_reason=(
+                "QQ 音乐解析服务拒绝访问，请检查解析源配置"
+                if resp.status in {401, 403} else ""
+            ),
+            source_failure=resp.status == 429 or resp.status >= 500,
+        )
+
+    async def _request_qq_vip_resolver_url(
+        self,
+        session: aiohttp.ClientSession,
+        song: Song,
+        deadline: float,
+        resolver_url: str | None = None,
+    ) -> str:
+        def timeout():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            return aiohttp.ClientTimeout(total=remaining)
+
+        resolver_url = resolver_url or self.qq_vip_resolver_url
+        resolver_path = urlparse(resolver_url).path.rstrip("/").lower()
         if resolver_path.endswith("/song/url"):
             params = {
                 "mid": song.id,
@@ -897,70 +1184,78 @@ class MusicSearcher:
                 "type": "song",
                 "id": song.id,
             }
-        try:
-            session = await self._get_session()
-            async with session.get(
-                self.qq_vip_resolver_url,
-                params=params,
-                headers=self.HEADERS,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    return False
+        async with session.get(
+            resolver_url,
+            params=params,
+            headers=self.HEADERS,
+            timeout=timeout(),
+        ) as resp:
+            self._check_qq_resolver_status(resp)
+            try:
                 result = await resp.json(content_type=None)
+            except (ValueError, UnicodeError) as exc:
+                raise _QQResolverFailure("Invalid JSON response") from exc
+        if not result:
+            raise _QQResolverFailure("Empty response", source_failure=False)
 
-            audio_url = ""
-            if isinstance(result, dict) and result.get("code") in {0, "0"}:
-                data = result.get("data")
-                if isinstance(data, dict):
-                    candidate = data.get(song.id)
-                    if isinstance(candidate, str):
-                        audio_url = candidate.strip()
-            elif isinstance(result, list):
-                exact_match = False
-                for item in result:
-                    if not isinstance(item, dict):
-                        continue
-                    result_mid = str(item.get("songmid", "") or "")
-                    if not result_mid:
-                        result_mid = self._extract_meting_id(
-                            str(item.get("url", "") or "")
-                        ) or self._extract_meting_id(
-                            str(item.get("lrc", "") or "")
-                        )
-                    if result_mid == song.id:
-                        exact_match = True
-                        break
-                if not exact_match:
-                    return False
-                async with session.get(
-                    self.qq_vip_resolver_url,
-                    params={
-                        "server": "tencent",
-                        "type": "url",
-                        "id": song.id,
-                    },
-                    headers=self.HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    allow_redirects=False,
-                ) as resp:
-                    if 300 <= resp.status < 400:
-                        audio_url = str(resp.headers.get("Location", "") or "").strip()
-
-            if audio_url.startswith("http://"):
-                audio_url = "https://" + audio_url[len("http://"):]
-            if not audio_url or not self._is_qq_audio_url(audio_url):
-                return False
-        except Exception as e:
-            logger.warning(
-                f"[KookMusic] QQ音乐会员解析源异常 {song.id}: {e}"
+        audio_url = ""
+        if isinstance(result, dict) and result.get("code") in {0, "0"}:
+            data = result.get("data")
+            if not data:
+                raise _QQResolverFailure("Empty song data", source_failure=False)
+            if isinstance(data, dict):
+                candidate = data.get(song.id)
+                if isinstance(candidate, str):
+                    audio_url = candidate.strip()
+                    if not audio_url:
+                        raise _QQResolverFailure("Empty audio URL", source_failure=False)
+        elif isinstance(result, list):
+            exact_match = False
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                result_mid = str(item.get("songmid", "") or "")
+                if not result_mid:
+                    result_mid = self._extract_meting_id(
+                        str(item.get("url", "") or "")
+                    ) or self._extract_meting_id(
+                        str(item.get("lrc", "") or "")
+                    )
+                if result_mid == song.id:
+                    exact_match = True
+                    break
+            if not exact_match:
+                return ""
+            async with session.get(
+                resolver_url,
+                params={
+                    "server": "tencent",
+                    "type": "url",
+                    "id": song.id,
+                },
+                headers=self.HEADERS,
+                timeout=timeout(),
+                allow_redirects=False,
+            ) as resp:
+                self._check_qq_resolver_status(resp, redirect=True)
+                audio_url = str(resp.headers.get("Location", "") or "").strip()
+                if not audio_url:
+                    raise _QQResolverFailure("Empty redirect", source_failure=False)
+        else:
+            code = str(result.get("code", "")) if isinstance(result, dict) else ""
+            raise _QQResolverFailure(
+                "Invalid resolver response",
+                retryable=code == "429" or code.startswith("5"),
+                user_reason=(
+                    "QQ 音乐解析服务拒绝访问，请检查解析源配置"
+                    if code in {"401", "403"} else ""
+                ),
+                source_failure=code == "429" or code.startswith("5"),
             )
-            return False
 
-        song.audio_url = audio_url
-        song.unplayable_reason = ""
-        song.provider_data["resolver_status"] = "resolved"
-        return True
+        if audio_url.startswith("http://"):
+            audio_url = "https://" + audio_url[len("http://"):]
+        return audio_url if audio_url and self._is_qq_audio_url(audio_url) else ""
 
     async def _fetch_kugou_song_by_id(self, song_id: str) -> Song | None:
         """按酷狗 FileHash 获取当次有效的完整歌曲 URL。"""
@@ -1054,7 +1349,7 @@ class MusicSearcher:
             return None
 
         if platform == "qq":
-            song_id = self._extract_qq_song_id(url)
+            song_id = await self._resolve_qq_song_id(url)
         else:
             song_id = self._extract_kugou_hash(url)
             if not song_id:
@@ -1077,8 +1372,72 @@ class MusicSearcher:
 
     @staticmethod
     def _extract_http_url(text: str) -> str:
-        match = re.search(r"https?://[^\s]+", text, re.IGNORECASE)
+        text = html.unescape(text)
+        text = re.sub(r"\\([_*\[\]()<>])", r"\1", text)
+        # Prefer a Markdown link's destination, not its potentially different label.
+        markdown = re.search(r"\[[^\]\r\n]*\]\(\s*(https?://[^\s)]+)", text, re.IGNORECASE)
+        if markdown:
+            text = markdown.group(1)
+        match = re.search(r"https?://[^\s<>\[\]()\"'`*]+", text, re.IGNORECASE)
         return match.group(0).rstrip(",.;，。；>)]】）") if match else ""
+
+    @staticmethod
+    def _is_qq_page_url(url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            return (
+                parsed.scheme.lower() == "https"
+                and (host == "y.qq.com" or host.endswith(".y.qq.com"))
+                and not parsed.username
+                and not parsed.password
+                and parsed.port in (None, 443)
+            )
+        except ValueError:
+            return False
+
+    async def _resolve_qq_song_id(self, url: str) -> str:
+        """展开官方分享短链；每次跳转先检查域名，再提取稳定歌曲 ID。"""
+        current_url = url
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme == "http" and parsed.port in (None, 80):
+                current_url = parsed._replace(
+                    scheme="https", netloc=parsed.netloc.removesuffix(":80")
+                ).geturl()
+        except ValueError:
+            return ""
+        visited: set[str] = set()
+        deadline = asyncio.get_running_loop().time() + 20
+        for _ in range(6):
+            if not self._is_qq_page_url(current_url) or current_url in visited:
+                return ""
+            song_id = self._extract_qq_song_id(current_url)
+            if song_id:
+                return song_id
+            visited.add(current_url)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return ""
+            session = await self._get_session()
+            try:
+                async with session.get(
+                    current_url,
+                    allow_redirects=False,
+                    headers=self.QQ_AUDIO_HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=min(10, remaining)),
+                ) as response:
+                    if response.status not in {301, 302, 303, 307, 308}:
+                        return ""
+                    location = response.headers.get("Location", "")
+                    if not location:
+                        return ""
+                current_url = urljoin(current_url, location)
+            except Exception as exc:
+                logger.warning(f"[KookMusic] QQ音乐分享短链解析失败: {type(exc).__name__}")
+                return ""
+        logger.warning("[KookMusic] QQ音乐分享短链重定向次数过多")
+        return ""
 
     @staticmethod
     def _extract_qq_song_id(url: str) -> str:
@@ -1092,6 +1451,9 @@ class MusicSearcher:
                 values = params.get(key)
                 if values and re.fullmatch(r"[A-Za-z0-9]+", values[0]):
                     return values[0]
+            values = params.get("songid")
+            if values and re.fullmatch(r"[0-9]{1,20}", values[0]):
+                return values[0]
         match = _QQ_SONG_PATH_PATTERN.search(parsed.path)
         return match.group(1) if match else ""
 

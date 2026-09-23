@@ -15,9 +15,22 @@
     },
     "qq_vip_resolver_url": {
         "description": "QQ音乐会员解析源",
-        "hint": "QQ 官方匿名接口无法播放会员歌曲时，按原歌曲 MID 调用此解析源。支持 Meting API 端点或 ygking song/url 端点；留空可禁用。",
+        "hint": "QQ 官方匿名接口无法播放时，按原歌曲 MID 调用主解析源，再尝试备用源。支持 Meting API 或 ygking song/url 协议；主源留空会禁用整条额外解析链路。可以填写管理员自行部署的服务，不要把个人 Cookie 发给公共解析站。",
         "type": "string",
         "default": "https://meting.mikus.ink/api"
+    },
+    "qq_vip_resolver_backups": {
+        "description": "QQ音乐备用解析源（按优先级）",
+        "hint": "最多使用 3 个去重备用端点。主源 522/超时等失败时按顺序切换，所有源共用 15 秒预算；只接受同一歌曲 MID 和 QQ 官方音频域。不默认加入未经验证的公共站。自建服务须兼容 Meting 或 ygking 协议。",
+        "type": "list",
+        "default": []
+    },
+    "qq_vip_resolver_cooldown_seconds": {
+        "description": "QQ解析源连续故障冷却（秒）",
+        "hint": "同一源累计两次临时网络/服务故障后暂时跳过，避免每首反复访问故障站；歌曲不匹配或无可用音频不导致整站冷却。0 为关闭冷却。",
+        "type": "int",
+        "slider": {"min": 0, "max": 3600, "step": 10},
+        "default": 60
     },
     "qq_vip_resolver_quality": {
         "description": "QQ音乐解析音质",
@@ -30,15 +43,60 @@
         ],
         "default": "320"
     },
+    "music_auth_enabled": {
+        "description": "启用管理员私聊音乐账号登录",
+        "hint": "必须同时配置下方 KOOK 用户 ID 白名单。支持 QQ音乐(QQ/微信扫码) 和网易云；未配置管理员时不初始化凭据、不发送提醒。",
+        "type": "bool",
+        "default": true
+    },
+    "music_auth_admin_ids": {
+        "description": "音乐账号所有者的 KOOK 用户 ID",
+        "hint": "仅这些用户可以私聊登录、取消、退出账号并接收失效提醒。填写数字用户 ID，不是昵称或 #识别号；不沿用普通服务器管理员权限。",
+        "type": "list",
+        "default": []
+    },
+    "music_auth_kook_bot_id": {
+        "description": "音乐账号私聊使用的 KOOK 适配器 ID",
+        "hint": "填写 AstrBot 中机器人实例的 ID；留空仅在恰好一个 KOOK 适配器时自动选择。多个机器人必须明确指定，防止凭据操作串线。",
+        "type": "string",
+        "default": ""
+    },
+    "music_auth_check_interval": {
+        "description": "音乐账号登录状态检查间隔（秒）",
+        "hint": "启动检查后按此周期复查；仅明确登录失效才尝试刷新/提醒，网络异常保留原凭据。",
+        "type": "int",
+        "slider": {"min": 300, "max": 86400, "step": 300},
+        "default": 1800
+    },
+    "music_auth_notice_cooldown": {
+        "description": "同类音乐账号私聊提醒最短间隔（秒）",
+        "hint": "默认 6 小时，持久化去重，避免重启或上游故障轰炸管理员。不会自动发送登录二维码，需管理员明确发送私聊登录命令。",
+        "type": "int",
+        "slider": {"min": 300, "max": 604800, "step": 300},
+        "default": 21600
+    },
+    "music_auth_login_timeout": {
+        "description": "音乐扫码登录最长等待（秒）",
+        "hint": "默认 180 秒，并受平台二维码实际有效期限制。取消、超时、完成和卸载均停止轮询，并尝试删除二维码私信。",
+        "type": "int",
+        "slider": {"min": 30, "max": 300, "step": 30},
+        "default": 180
+    },
     "streaming_mode": {
         "description": "推流模式",
-        "hint": "relay: 中继管道推流，RTP 流不中断，切歌更流畅（推荐）；direct: 每首歌独立推流，切歌时重建 RTP 连接。如果播放第二首歌没有声音，请尝试切换模式。",
+        "hint": "relay: 持续 PCM 管道推流，首次静音预热后播放，切歌保持同一 RTP 时间线（推荐）；direct: 每首歌独立推流，切歌时重建 RTP 连接。",
         "type": "string",
         "options": [
             "relay",
             "direct"
         ],
         "default": "relay"
+    },
+    "prefetch_next": {
+        "description": "预准备下一首歌曲",
+        "hint": "播放当前歌曲时，后台最多提前准备下一首普通歌曲，降低切歌等待；不会批量下载歌单。B站视频仍在轮到时即时准备，单曲循环和随机模式不预准备。",
+        "type": "bool",
+        "default": true
     },
     "bili_stream_threshold_minutes": {
         "description": "B站长视频流式阈值(分钟)",

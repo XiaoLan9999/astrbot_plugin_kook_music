@@ -2,3 +2,6 @@ aiohttp
 aiofiles
 psutil
 yt-dlp
+cryptography>=47
+qrcode[pil]>=8.2,<9
+qqmusic-api-python @ git+https://github.com/L-1124/QQMusicApi.git@ba95861ee9391f5b5f60f89caa8d4de4af160c8b

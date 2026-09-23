@@ -8,6 +8,7 @@ KOOK 语音频道 WebSocket 客户端。
 import asyncio
 import json
 import logging
+import math
 import random
 import time
 
@@ -37,6 +38,14 @@ class VoiceClient:
         self._rtp_ready = asyncio.Event()
         self._is_exit = False
         self._tasks: list[asyncio.Task] = []
+        self._remote_removed = False
+        self._removed_event = asyncio.Event()
+        self._removal_task: asyncio.Task | None = None
+        self.on_remote_removed: callable = None
+        self._expected_exits: list[tuple[str, float]] = []
+        self._ignored_exit_timestamps: dict[tuple[str, float], float] = {}
+        self._server_joined_at: float = 0.0
+        self._awaiting_join_event = True
 
         # mediasoup Transport/Producer ID（用于关闭旧传输）
         self._transport_id: str = ""
@@ -56,6 +65,84 @@ class VoiceClient:
         return self._connected.is_set()
 
     @property
+    def remote_removed(self) -> bool:
+        return self._remote_removed
+
+    @staticmethod
+    def _event_timestamp(value) -> float | None:
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
+
+    def note_channel_joined(self, channel_id: str, joined_at):
+        """使用 KOOK 服务端时间识别旧退出，不能与本机时钟作比较。"""
+        timestamp = self._event_timestamp(joined_at)
+        if (
+            str(channel_id) == self.channel_id
+            and timestamp is not None
+            and timestamp > self._server_joined_at
+        ):
+            self._server_joined_at = timestamp
+            self._awaiting_join_event = False
+
+    def consume_expected_exit(
+        self, channel_id: str, occurred_at: float | None = None
+    ) -> bool:
+        """匹配正常 RTP 重连引起的一次频道退出事件。"""
+        now = time.monotonic()
+        self._expected_exits = [
+            item for item in self._expected_exits if item[1] > now
+        ]
+        occurred_at = self._event_timestamp(occurred_at)
+        self._ignored_exit_timestamps = {
+            key: expiry for key, expiry in self._ignored_exit_timestamps.items()
+            if expiry > now
+        }
+        event_key = (str(channel_id), occurred_at)
+        if occurred_at is not None:
+            if event_key in self._ignored_exit_timestamps:
+                return True
+            if occurred_at < self._server_joined_at:
+                return True
+            if not self._is_exit and not self._awaiting_join_event:
+                return False
+        for index, (expected_channel, _) in enumerate(self._expected_exits):
+            if expected_channel == str(channel_id):
+                self._expected_exits.pop(index)
+                if occurred_at is not None:
+                    self._ignored_exit_timestamps[event_key] = now + 30.0
+                return True
+        return False
+
+    def mark_remote_removed(self):
+        """只用于明确的远端移除，不将网络断线当作踢出。"""
+        if self._remote_removed:
+            return
+        self._remote_removed = True
+        self._is_exit = True
+        self._connected.clear()
+        self._rtp_ready.clear()
+        self._removed_event.set()
+        self.rtp_url = ""
+        callback = self.on_remote_removed
+
+        async def notify_removed():
+            try:
+                if callback:
+                    result = callback(self)
+                    if asyncio.isfuture(result) or asyncio.iscoroutine(result):
+                        await result
+            except Exception as exc:
+                logger.error(f"[KookVoice] 远端移除回调异常: {exc}")
+            finally:
+                await self.disconnect()
+
+        # 清理会 await WS 接收任务，不能在该任务中直接执行回调。
+        self._removal_task = asyncio.create_task(notify_removed())
+
+    @property
     def is_rtp_ready(self) -> bool:
         return self._rtp_ready.is_set()
 
@@ -73,7 +160,7 @@ class VoiceClient:
     async def reconnect(self, channel_id: str = "", timeout: float = 15.0) -> bool:
         """重新连接语音频道（完全断开并重连，会导致 BOT 离开再进入频道）"""
         target_channel = channel_id or self.channel_id
-        if not target_channel:
+        if not target_channel or self._remote_removed:
             return False
         await self.disconnect()
         return await self.connect(target_channel, timeout)
@@ -134,7 +221,12 @@ class VoiceClient:
         Returns:
             True 表示刷新成功，False 表示失败（此时应 fallback 到完整 reconnect）
         """
-        if not self._ws or self._ws.closed or not self._connected.is_set():
+        if (
+            self._remote_removed
+            or not self._ws
+            or self._ws.closed
+            or not self._connected.is_set()
+        ):
             logger.warning("[KookVoice] WebSocket 未连接，无法刷新 RTP")
             return False
 
@@ -222,6 +314,9 @@ class VoiceClient:
             # 保存新的 Producer ID
             new_producer_id = produce_resp.get("data", {}).get("id", "")
 
+            if self._remote_removed:
+                return False
+
             # 更新 RTP 参数
             self._transport_id = transport_id
             self._producer_id = new_producer_id
@@ -236,13 +331,15 @@ class VoiceClient:
         except asyncio.TimeoutError:
             logger.error("[KookVoice] RTP 刷新超时")
             # 恢复旧值
-            self.rtp_url = old_rtp
-            self._rtp_ready.set()
+            if not self._remote_removed:
+                self.rtp_url = old_rtp
+                self._rtp_ready.set()
             return False
         except Exception as e:
             logger.error(f"[KookVoice] RTP 刷新异常: {e}")
-            self.rtp_url = old_rtp
-            self._rtp_ready.set()
+            if not self._remote_removed:
+                self.rtp_url = old_rtp
+                self._rtp_ready.set()
             return False
         finally:
             self._refreshing = False
@@ -258,6 +355,9 @@ class VoiceClient:
         Returns:
             是否成功连接并获取 RTP 地址
         """
+        if self._remote_removed:
+            return False
+        self._awaiting_join_event = True
         self.channel_id = channel_id
         self.rtp_url = ""
         self.ssrc = 0
@@ -268,7 +368,7 @@ class VoiceClient:
         try:
             # 获取语音网关 URL
             gateway = await self._get_gateway(channel_id)
-            if not gateway:
+            if not gateway or self._remote_removed:
                 logger.error("[KookVoice] 无法获取语音网关地址")
                 return False
 
@@ -285,10 +385,21 @@ class VoiceClient:
             self._tasks = [ws_task, ping_task]
 
             # 等待 RTP 准备完成
+            ready_task = asyncio.create_task(self._rtp_ready.wait())
+            removed_task = asyncio.create_task(self._removed_event.wait())
             try:
-                await asyncio.wait_for(self._rtp_ready.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.error("[KookVoice] RTP 协商超时")
+                done, _ = await asyncio.wait(
+                    [ready_task, removed_task],
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for waiter in (ready_task, removed_task):
+                    if not waiter.done():
+                        waiter.cancel()
+                await asyncio.gather(ready_task, removed_task, return_exceptions=True)
+            if not done or self._remote_removed or not self._rtp_ready.is_set():
+                logger.error("[KookVoice] RTP 协商失败或连接已被远端移除")
                 await self.disconnect()
                 return False
 
@@ -305,19 +416,21 @@ class VoiceClient:
 
     async def disconnect(self):
         """断开语音连接"""
+        if self._connected.is_set() and self.channel_id and not self._remote_removed:
+            self._expected_exits.append((self.channel_id, time.monotonic() + 15.0))
         self._is_exit = True
         self._connected.clear()
         self._rtp_ready.clear()
 
         # 取消后台任务
-        for task in self._tasks:
-            if not task.done():
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
+            if task is not asyncio.current_task() and not task.done():
                 task.cancel()
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-        self._tasks.clear()
 
         # 关闭 WebSocket
         if self._ws and not self._ws.closed:
@@ -368,6 +481,7 @@ class VoiceClient:
         """处理 WebSocket 消息，完成 RTP 协商"""
         if not self._ws:
             return
+        websocket = self._ws
 
         # 准备协商载荷（来自 KO-ON-Bot）
         self.ssrc = random.randint(1000, 9999)
@@ -417,14 +531,14 @@ class VoiceClient:
 
         # 发送第一步
         logger.debug("[KookVoice] 发送 getRouterRtpCapabilities")
-        await self._ws.send_json(payloads["1"])
+        await websocket.send_json(payloads["1"])
 
         step = 1
         pending_messages: list[str] = []
 
         try:
-            async for msg in self._ws:
-                if self._is_exit:
+            async for msg in websocket:
+                if self._is_exit or self._ws is not websocket:
                     return
 
                 if msg.type == aiohttp.WSMsgType.TEXT:
@@ -445,6 +559,15 @@ class VoiceClient:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
+
+                    if (
+                        isinstance(data, dict)
+                        and data.get("notification")
+                        and data.get("method") == "disconnect"
+                    ):
+                        logger.warning("[KookVoice] 收到远端移除通知，结束语音会话")
+                        self.mark_remote_removed()
+                        return
 
                     if step == 1:
                         # 收到 RtpCapabilities → 发送 join
@@ -495,14 +618,6 @@ class VoiceClient:
                         if self._refreshing:
                             # RTP 刷新正在进行，将响应路由到刷新队列
                             await self._refresh_response.put(data)
-                        elif (
-                            isinstance(data, dict)
-                            and data.get("notification")
-                            and data.get("method") == "disconnect"
-                        ):
-                            logger.warning(
-                                "[KookVoice] 收到断开通知"
-                            )
 
         except asyncio.CancelledError:
             return

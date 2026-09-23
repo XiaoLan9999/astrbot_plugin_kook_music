@@ -454,7 +454,7 @@ class MusicPlatformAsyncTests(unittest.IsolatedAsyncioTestCase):
                 )
                 searcher._search_via_aggregator.assert_not_awaited()
 
-    async def test_qq_vip_resolver_exception_preserves_denied_reason(self):
+    async def test_qq_vip_resolver_exception_replaces_stale_denied_reason(self):
         direct = Song(
             id="paid-mid",
             platform="qq",
@@ -472,8 +472,11 @@ class MusicPlatformAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(resolved, direct)
         self.assertEqual(resolved.audio_url, "")
-        self.assertEqual(resolved.unplayable_reason, "会员歌曲")
-        self.assertEqual(resolved.provider_data["resolver_status"], "denied")
+        self.assertEqual(
+            resolved.unplayable_reason,
+            "QQ 音乐解析服务暂时不可用，请稍后重试",
+        )
+        self.assertEqual(resolved.provider_data["resolver_status"], "transient")
         searcher._search_via_aggregator.assert_not_awaited()
 
     async def test_qq_vip_resolver_retry_clears_prior_denied_reason(self):

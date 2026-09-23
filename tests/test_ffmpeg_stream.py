@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import unittest
 from pathlib import Path
@@ -37,7 +38,10 @@ class _FakeProcess:
     def __init__(self, pid=4321, returncode=None, stderr=None):
         self.pid = pid
         self.returncode = returncode
-        self.stdout = None
+        self.stdout = asyncio.StreamReader()
+        if returncode in (None, 0):
+            self.stdout.feed_data(bytes(RelayFFmpegPlayer.FRAME_BYTES))
+        self.stdout.feed_eof()
         self.stderr = stderr
 
     async def wait(self):
@@ -47,6 +51,9 @@ class _FakeProcess:
 
     def kill(self):
         self.returncode = -9
+
+    async def communicate(self):
+        return await self.stdout.read(), b""
 
 
 def _render_log_calls(mocked_logger_method):
@@ -133,7 +140,6 @@ class FFmpegHttpInputTests(unittest.IsolatedAsyncioTestCase):
         process = _FakeProcess()
         player = RelayFFmpegPlayer()
         player._relay = _FakeProcess(pid=1111)
-        player._udp_port = 54321
 
         with (
             patch.object(
@@ -188,7 +194,6 @@ class FFmpegHttpInputTests(unittest.IsolatedAsyncioTestCase):
         process = _FakeProcess(returncode=1, stderr=stderr)
         player = RelayFFmpegPlayer()
         player._relay = _FakeProcess(pid=1111)
-        player._udp_port = 54321
 
         with (
             patch.object(

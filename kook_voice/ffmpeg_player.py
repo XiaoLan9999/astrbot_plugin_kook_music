@@ -4,17 +4,15 @@ FFmpeg 进程管理器。
 
 支持两种推流模式：
   - DirectFFmpegPlayer：每首歌启动独立 FFmpeg 直连 RTP（简单，但歌曲切换时 RTP 会中断）
-  - RelayFFmpegPlayer：基于 UDP 的双进程中继推流（RTP 不中断，切歌无缝衔接）
+  - RelayFFmpegPlayer：PCM 管道接入常驻 Opus 编码器（RTP 时间戳持续递增）
 
-RelayFFmpegPlayer 架构（借鉴 KO-ON-Bot）：
-  歌曲进程: ffmpeg -re -i song.mp3 -acodec libopus -f mpegts udp://127.0.0.1:{port}
-  中继进程: ffmpeg -i udp://127.0.0.1:{port} -c:a copy -f rtp {rtp_url}
-  切歌时只需 kill 歌曲进程并启新进程，中继进程的 RTP 连接始终保持。
+歌曲解码为有界缓冲的 PCM，由 20ms 节拍写入常驻编码器；无歌曲时填充静音。
+避免 MPEGTS 探测丢失首段音频，以及切歌时各歌曲时间戳归零。
 """
 import asyncio
 import logging
 import re
-import socket
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -255,150 +253,150 @@ class DirectFFmpegPlayer:
             return False
 
 
+@dataclass
+class _PCMTrack:
+    process: asyncio.subprocess.Process | None = None
+    frames: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=25))
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    has_audio: bool = False
+    played_bytes: int = 0
+    decoded: bool = False
+    exit_code: int | None = None
+    decoder_task: asyncio.Task | None = None
+    stderr_task: asyncio.Task | None = None
+
+
 class RelayFFmpegPlayer:
-    """UDP 中继模式：常驻中继进程 + 每首歌独立歌曲进程
+    """Decode songs to PCM while one encoder maintains the RTP clock."""
 
-    架构（借鉴 KO-ON-Bot，使用 UDP 本地通信）：
-      歌曲进程: ffmpeg -re -i song.mp3 -acodec libopus -f mpegts udp://127.0.0.1:{port}
-      中继进程: ffmpeg -i udp://127.0.0.1:{port} -c:a copy -f rtp {rtp_url}
-
-    中继进程在加入语音频道时启动，退出时才停止，RTP 流始终保持。
-    歌曲切换时只需 kill 旧歌曲进程 + 启动新歌曲进程，中继进程完全不受影响。
-    """
+    SAMPLE_RATE = 48000
+    FRAME_SECONDS = 0.02
+    FRAME_BYTES = 3840  # 960 stereo signed 16-bit samples.
+    WARMUP_SECONDS = 2.0
+    SOURCE_READY_TIMEOUT = 30.0
 
     def __init__(self, ffmpeg_path: str = "ffmpeg", volume: float = 0.15):
         self.volume = volume
         self.ffmpeg_path = ffmpeg_path
-        # 常驻中继进程（RTP 推流）
         self._relay: asyncio.subprocess.Process | None = None
-        # 当前歌曲进程（编码 → UDP）
-        self._song_proc: asyncio.subprocess.Process | None = None
-        # 歌曲播放完成事件
-        self._song_done: asyncio.Event = asyncio.Event()
-        self._song_done.set()  # 初始为已完成状态
-        # 歌曲完成监控任务
-        self._song_monitor: asyncio.Task | None = None
-        self._song_exit_code: int | None = None
-        self._current_file: str = ""
-        # UDP 中继端口
-        self._udp_port: int = 0
-        # 保存 RTP 参数（用于切歌时重建中继）
-        self._rtp_url: str = ""
-        self._ssrc: int = 0
+        self._feed_task: asyncio.Task | None = None
+        self._relay_stderr_task: asyncio.Task | None = None
+        self._relay_failed = False
+        self._song: _PCMTrack | None = None
+        self._current_file = ""
 
     @property
     def is_playing(self) -> bool:
-        """当前是否有歌曲在播放"""
-        return self._song_proc is not None and self._song_proc.returncode is None
+        return self._song is not None and not self._song.done.is_set()
+
+    @property
+    def played_seconds(self) -> float:
+        """Media emitted this play(), excluding relay warmup/underflow silence."""
+        return self._song.played_bytes / (self.SAMPLE_RATE * 4) if self._song else 0.0
 
     @property
     def is_relay_running(self) -> bool:
-        """中继进程是否在运行"""
-        return self._relay is not None and self._relay.returncode is None
+        return (
+            self._relay is not None
+            and self._relay.returncode is None
+            and not self._relay_failed
+        )
 
     async def start_relay(self, rtp_url: str, ssrc: int) -> bool:
-        """启动常驻中继进程（加入语音频道时调用）。
-
-        中继进程通过 UDP 接收 mpegts 数据，然后通过 RTP 推送到 KOOK。
-
-        Args:
-            rtp_url: KOOK 语音服务器 RTP 地址 (rtp://ip:port?rtcpport=xxx)
-            ssrc: KOOK 分配的 SSRC 值
-        """
-        # 保存参数，切歌时用于重建中继
-        self._rtp_url = rtp_url
-        self._ssrc = ssrc
-
         if self.is_relay_running:
-            logger.warning("[KookMusic] 中继进程已在运行")
             return True
-
-        # 分配 UDP 中继端口
-        self._udp_port = _find_free_port()
-        if not self._udp_port:
-            logger.error("[KookMusic] 无法分配 UDP 端口")
-            return False
-
-        return await self._start_relay_internal()
-
-    async def _start_relay_internal(self) -> bool:
-        """启动中继进程的内部实现（使用当前的 _udp_port 和 _rtp_url/_ssrc）"""
-        # 解析 RTP 地址
-        parsed = urlparse(self._rtp_url)
-        rtp_host = parsed.hostname or ""
-        rtp_port = parsed.port or 0
-        qs = parse_qs(parsed.query)
-        rtcp_port = qs.get("rtcpport", ["0"])[0]
-
-        # 中继进程命令：从 UDP 读取 mpegts → 直接转发 → RTP 推流
-        # 中继 bind UDP 端口（持久），歌曲进程 send 到此端口（无状态）
-        # UDP 无连接态，kill 歌曲进程后无 TIME_WAIT，新歌曲直接复用端口
-        # -fflags nobuffer: 减少输入缓冲，降低延迟
-        # -c:a copy: 直接复制 opus 数据，不重新解码/编码
-        udp_input = (
-            f"udp://127.0.0.1:{self._udp_port}"
-            f"?overrun_nonfatal=1&fifo_size=50&timeout=0"
-        )
+        await self.stop_relay()
+        parsed = urlparse(rtp_url)
+        host = parsed.hostname or ""
+        port = parsed.port or 0
+        rtcp_port = parse_qs(parsed.query).get("rtcpport", ["0"])[0]
         cmd = [
-            self.ffmpeg_path,
-            "-f", "mpegts",
-            "-fflags", "nobuffer",
-            "-probesize", "32768",
-            "-analyzeduration", "0",
-            "-loglevel", "warning",
-            "-nostats",
-            "-i", udp_input,
-            "-map", "0:a:0",
-            "-c:a", "copy",
-            "-f", "tee",
-            f"[select=a:f=rtp:ssrc={self._ssrc}:payload_type=100]"
-            f"rtp://{rtp_host}:{rtp_port}?rtcpport={rtcp_port}",
+            self.ffmpeg_path, "-nostdin", "-nostats", "-loglevel", "warning",
+            "-f", "s16le", "-ar", str(self.SAMPLE_RATE), "-ac", "2",
+            "-probesize", "32", "-analyzeduration", "0", "-i", "pipe:0",
+            "-map", "0:a:0", "-acodec", "libopus", "-ab", "128k",
+            "-frame_duration", "20", "-flush_packets", "1",
+            "-ssrc", str(ssrc), "-payload_type", "100", "-f", "rtp",
+            f"rtp://{host}:{port}?rtcpport={rtcp_port}",
         ]
-
-        cmd_str = " ".join(f'"{c}"' if " " in c or "?" in c else c for c in cmd)
-        logger.info(f"[KookMusic] 中继进程启动: {cmd_str[:300]}...")
-
         try:
-            self._relay = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
+            self._relay = await self._spawn(
+                cmd, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-
-            # 检查是否立即退出
-            await asyncio.sleep(1.5)
-            if self._relay.returncode is not None:
-                stderr_data = b""
-                if self._relay.stderr:
-                    stderr_data = await self._relay.stderr.read()
-                stderr_text = stderr_data.decode("utf-8", errors="replace") if stderr_data else ""
-                logger.error(
-                    f"[KookMusic] 中继进程提前退出 "
-                    f"(exit={self._relay.returncode}): "
-                    f"{_redact_signed_urls(stderr_text)[:500]}"
-                )
-                self._relay = None
-                return False
-
-            logger.info(
-                f"[KookMusic] 中继进程 PID: {self._relay.pid}, "
-                f"UDP 端口: {self._udp_port}"
+            self._relay_failed = False
+            self._relay_stderr_task = asyncio.create_task(
+                self._read_relay_stderr(self._relay.stderr)
             )
-
-            # 后台读取 stderr（捕获引用防止悬垂）
-            relay_stderr = self._relay.stderr
-            if relay_stderr:
-                asyncio.create_task(self._read_relay_stderr(relay_stderr))
+            self._feed_task = asyncio.create_task(self._feed_pcm(self._relay))
+            # Warm up the voice transport using silence, not the song's opening.
+            await asyncio.sleep(self.WARMUP_SECONDS)
+            if not self.is_relay_running:
+                await self.stop_relay()
+                return False
+            logger.info("[KookMusic] PCM relay ready, PID: %s", self._relay.pid)
             return True
+        except asyncio.CancelledError:
+            await self.stop_relay()
+            raise
+        except Exception as exc:
+            logger.error("[KookMusic] PCM relay failed (%s): %s", type(exc).__name__, _redact_signed_urls(str(exc)))
+            await self.stop_relay()
+            return False
 
-        except FileNotFoundError:
-            logger.error(f"[KookMusic] FFmpeg 未找到: {self.ffmpeg_path}")
-            self._relay = None
-            return False
-        except Exception as e:
-            logger.error(f"[KookMusic] 中继进程启动异常: {e}")
-            self._relay = None
-            return False
+    @staticmethod
+    async def _spawn(command, **kwargs):
+        # Cancellation during process creation must not orphan a decoder/encoder.
+        task = asyncio.create_task(asyncio.create_subprocess_exec(*command, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            async def reap_late_process():
+                process = await task
+                await RelayFFmpegPlayer._terminate_process(process)
+
+            await RelayFFmpegPlayer._finish_cleanup(reap_late_process())
+            raise
+
+    async def _feed_pcm(self, relay):
+        silence = bytes(self.FRAME_BYTES)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time()
+        try:
+            while relay is self._relay and relay.returncode is None:
+                track = self._song
+                frame = silence
+                song_frame = False
+                if track and not track.done.is_set():
+                    try:
+                        frame = track.frames.get_nowait()
+                        song_frame = True
+                    except asyncio.QueueEmpty:
+                        if track.decoded:
+                            track.done.set()
+                relay.stdin.write(frame)
+                await asyncio.wait_for(relay.stdin.drain(), timeout=1.0)
+                if song_frame:
+                    track.played_bytes += len(frame)
+                deadline += self.FRAME_SECONDS
+                # Do not burst buffered audio after an event-loop or pipe stall.
+                if deadline < loop.time() - self.FRAME_SECONDS:
+                    deadline = loop.time()
+                await asyncio.sleep(max(0, deadline - loop.time()))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[KookMusic] PCM relay stream failed (%s): %s", type(exc).__name__, _redact_signed_urls(str(exc)))
+        finally:
+            if relay is self._relay:
+                self._relay_failed = True
+                track = self._song
+                if track and not track.done.is_set():
+                    track.exit_code = 1
+                    track.ready.set()
+                    track.done.set()
 
     async def play(
         self,
@@ -408,235 +406,173 @@ class RelayFFmpegPlayer:
         extra_headers: dict | None = None,
         start_seconds: float = 0.0,
     ) -> bool:
-        """播放一首歌（启动歌曲进程将音频通过 UDP 推入中继）。
-
-        Args:
-            file_path: 本地音频文件路径
-            rtp_url: 兼容 Direct 模式参数，relay 模式忽略
-            ssrc: 兼容 Direct 模式参数，relay 模式忽略
-        """
         await self.stop()
-
-        if not self.is_relay_running:
-            logger.error("[KookMusic] 中继进程未运行，无法播放")
+        if not self.is_relay_running or not _source_exists(file_path):
+            logger.error("[KookMusic] Invalid relay/source: %s", _source_label(file_path))
             return False
-
-        if not _source_exists(file_path):
-            logger.error(f"[KookMusic] 音频播放源无效: {_source_label(file_path)}")
-            return False
-
-        return await self._try_start_song(file_path, extra_headers, start_seconds)
-
-    async def _try_start_song(
-        self,
-        file_path: str,
-        extra_headers: dict | None = None,
-        start_seconds: float = 0.0,
-    ) -> bool:
-        """尝试启动歌曲进程（单次尝试）"""
+        track = _PCMTrack()
+        self._song = track
         self._current_file = file_path
-        self._song_done.clear()
-        self._song_exit_code = None
-
-        # 歌曲进程命令：读取音频 → 编码为 Opus（含音量调整）→ 通过 UDP 推入中继
-        # -re 保证按实时速率推流（因为输入文件有时间戳）
         cmd = [
-            self.ffmpeg_path,
-            "-nostdin",
-            "-re",
-            "-nostats",
-            "-loglevel", "warning",
+            self.ffmpeg_path, "-nostdin", "-nostats", "-loglevel", "warning",
             *_http_input_args(file_path, extra_headers, start_seconds),
-            "-acodec", "libopus",
-            "-ab", "128k",
-            "-filter:a", f"volume={self.volume}",
-            "-ac", "2",
-            "-ar", "48000",
-            "-f", "mpegts",
-            f"udp://127.0.0.1:{self._udp_port}?pkt_size=1316",
+            "-map", "0:a:0", "-filter:a", f"volume={self.volume}",
+            "-acodec", "pcm_s16le", "-ac", "2", "-ar", str(self.SAMPLE_RATE),
+            "-f", "s16le", "pipe:1",
         ]
-
-        logger.info(f"[KookMusic] 歌曲进程启动: {_source_label(file_path)}")
-
         try:
-            self._song_proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            process = await self._spawn(
+                cmd, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, limit=65536,
             )
-
-            # 检查是否立即退出（非零退出码才算失败）
-            await asyncio.sleep(1.0)
-            if self._song_proc.returncode is not None and self._song_proc.returncode != 0:
-                stderr_data = b""
-                if self._song_proc.stderr:
-                    stderr_data = await self._song_proc.stderr.read()
-                stderr_text = stderr_data.decode("utf-8", errors="replace") if stderr_data else ""
-                logger.error(
-                    f"[KookMusic] 歌曲进程提前退出: "
-                    f"{_redact_signed_urls(stderr_text)[:300]}"
-                )
-                self._song_proc = None
-                self._song_done.set()
+            track.process = process
+            if self._song is not track:
+                await self._terminate_process(process)
                 return False
-
-            logger.info(f"[KookMusic] 歌曲进程 PID: {self._song_proc.pid}")
-
-            # 后台读取 stderr（捕获引用防止悬垂）
-            song_stderr = self._song_proc.stderr
-            if song_stderr:
-                asyncio.create_task(self._read_song_stderr(song_stderr))
-
-            # 启动歌曲完成监控
-            self._song_monitor = asyncio.create_task(self._monitor_song())
-
+            track.stderr_task = asyncio.create_task(self._read_song_stderr(process.stderr))
+            track.decoder_task = asyncio.create_task(self._decode_song(track))
+            await asyncio.wait_for(track.ready.wait(), self.SOURCE_READY_TIMEOUT)
+            failed_or_empty = track.done.is_set() and (
+                not track.has_audio or track.exit_code != 0
+            )
+            if self._song is not track or failed_or_empty or not self.is_relay_running:
+                if self._song is track:
+                    await self.stop()
+                return False
+            logger.info("[KookMusic] PCM song ready: %s", _source_label(file_path))
             return True
-
-        except FileNotFoundError:
-            logger.error(f"[KookMusic] FFmpeg 未找到: {self.ffmpeg_path}")
-            self._song_proc = None
-            self._song_done.set()
-            return False
-        except Exception as e:
-            logger.error(f"[KookMusic] 歌曲进程启动异常: {e}")
-            self._song_proc = None
-            self._song_done.set()
-            return False
-
-    async def _monitor_song(self):
-        """监控歌曲进程，结束时设置 _song_done 事件"""
-        try:
-            process = self._song_proc
-            if process:
-                exit_code = await process.wait()
-                if self._song_proc is process:
-                    self._song_exit_code = exit_code
         except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug(f"[KookMusic] 歌曲监控异常: {e}")
+            if self._song is track:
+                await self.stop()
+            raise
+        except Exception as exc:
+            logger.error("[KookMusic] PCM song failed (%s): %s", type(exc).__name__, _redact_signed_urls(str(exc)))
+            if self._song is track:
+                await self.stop()
+            return False
+
+    async def _decode_song(self, track):
+        try:
+            while self._song is track:
+                try:
+                    frame = await track.process.stdout.readexactly(self.FRAME_BYTES)
+                except asyncio.IncompleteReadError as exc:
+                    if exc.partial:
+                        await track.frames.put(exc.partial.ljust(self.FRAME_BYTES, b"\0"))
+                        track.has_audio = True
+                        track.ready.set()
+                    break
+                await track.frames.put(frame)
+                track.has_audio = True
+                track.ready.set()
+            track.exit_code = await track.process.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            track.exit_code = 1
+            logger.debug("[KookMusic] PCM decode failed: %s", _redact_signed_urls(str(exc)))
         finally:
-            self._song_done.set()
+            track.decoded = True
+            track.ready.set()
+            if not track.has_audio:
+                track.done.set()
 
     async def stop(self):
-        """停止当前歌曲进程（不影响中继进程）"""
-        await self._kill_song_proc()
-
-    async def _kill_song_proc(self):
-        """强制终止歌曲进程"""
-        # 取消监控任务
-        if self._song_monitor and not self._song_monitor.done():
-            self._song_monitor.cancel()
-            try:
-                await self._song_monitor
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._song_monitor = None
-
-        # 直接 kill 歌曲进程（UDP 无端口冲突问题）
-        if self._song_proc is not None:
-            try:
-                self._song_proc.kill()
-                await self._song_proc.wait()
-            except ProcessLookupError:
-                pass
-            except Exception as e:
-                logger.debug(f"[KookMusic] 停止歌曲进程异常: {e}")
-            self._song_proc = None
-
+        # Detach before any await, so no buffered old-song frames can be selected.
+        track, self._song = self._song, None
         self._current_file = ""
-        self._song_exit_code = None
-        self._song_done.set()
+        if track is None:
+            return
+        track.exit_code = None
+        track.ready.set()
+        track.done.set()
+        await self._finish_cleanup(self._cleanup_track(track))
 
+    async def _cleanup_track(self, track):
+        await self._cancel_task(track.decoder_task)
+        await self._cancel_task(track.stderr_task)
+        await self._terminate_process(track.process)
 
     async def stop_relay(self):
-        """停止中继进程和所有相关进程（退出语音频道时调用）"""
+        await self._finish_cleanup(self._cleanup_relay())
+
+    async def _cleanup_relay(self):
         await self.stop()
+        relay, self._relay = self._relay, None
+        feed, self._feed_task = self._feed_task, None
+        stderr, self._relay_stderr_task = self._relay_stderr_task, None
+        await self._cancel_task(feed)
+        await self._cancel_task(stderr)
+        await self._terminate_process(relay)
 
-        if self._relay is not None:
+    @staticmethod
+    async def _finish_cleanup(awaitable):
+        # Repeated skip/kick/unload cancellation must not interrupt process reaping.
+        task = asyncio.create_task(awaitable)
+        cancelled = False
+        while not task.done():
             try:
-                self._relay.kill()
-                await self._relay.wait()
-            except ProcessLookupError:
-                pass
-            except Exception as e:
-                logger.debug(f"[KookMusic] 停止中继进程异常: {e}")
-            self._relay = None
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
-        self._udp_port = 0
-        logger.info("[KookMusic] 中继进程已停止")
+    @staticmethod
+    async def _cancel_task(task):
+        if task and task is not asyncio.current_task():
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    @staticmethod
+    async def _terminate_process(process):
+        if process is None:
+            return
+        try:
+            if process.returncode is None:
+                process.kill()
+            # Draining stdout avoids Process.wait() hanging on a full decoder pipe.
+            await process.communicate()
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger.debug("[KookMusic] Process cleanup failed: %s", _redact_signed_urls(str(exc)))
 
     async def wait_until_done(self, timeout: float | None = None) -> bool:
-        """等待当前歌曲播放完成。
-
-        注意：本方法只负责等待，不负责清理进程引用。
-        调用方应在本方法返回后调用 stop() 确保进程已清理。
-
-        Args:
-            timeout: 最长等待秒数。超时后强制终止歌曲进程。
-
-        Returns:
-            True 表示正常播放完成，False 表示超时或异常。
-        """
-        if not self._song_proc:
+        track = self._song
+        if track is None:
             return False
         try:
-            if timeout is not None:
-                try:
-                    await asyncio.wait_for(self._song_done.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"[KookMusic] 播放超时 ({timeout:.0f}s)，强制终止歌曲进程"
-                    )
-                    await self.stop()
-                    return False
-            else:
-                await self._song_done.wait()
-            return self._song_exit_code == 0
-        except Exception:
+            await asyncio.wait_for(track.done.wait(), timeout)
+        except asyncio.TimeoutError:
+            if self._song is track:
+                await self.stop()
             return False
+        return track.exit_code == 0 and self.is_relay_running
 
     async def _read_relay_stderr(self, stderr_stream):
-        """后台读取中继进程 stderr
-
-        Args:
-            stderr_stream: 已捕获的 stderr 流引用
-        """
-        try:
-            async for line in stderr_stream:
-                text = line.decode("utf-8", errors="replace").strip()
-                if text:
-                    logger.debug(f"[KookMusic] 中继: {_redact_signed_urls(text)}")
-        except Exception:
-            pass
+        await self._read_log_stream(stderr_stream, "relay")
 
     async def _read_song_stderr(self, stderr_stream):
-        """后台读取歌曲进程 stderr
+        await self._read_log_stream(stderr_stream, "song")
 
-        Args:
-            stderr_stream: 已捕获的 stderr 流引用
-        """
+    @staticmethod
+    async def _read_log_stream(stderr_stream, label):
+        if stderr_stream is None:
+            return
         try:
             async for line in stderr_stream:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
-                    logger.debug(f"[KookMusic] 歌曲: {_redact_signed_urls(text)}")
+                    logger.debug("[KookMusic] %s: %s", label, _redact_signed_urls(text))
         except Exception:
             pass
-
-
-# ============ 工具函数 ============
-
-
-def _find_free_port() -> int:
-    """自动分配一个可用的 UDP 端口"""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
-    except OSError as e:
-        logger.error(f"[KookMusic] 端口分配失败: {e}")
-        return 0
 
 
 def create_player(
@@ -658,5 +594,5 @@ def create_player(
         logger.info("[KookMusic] 使用推流模式: direct (每首歌独立 RTP)")
         return DirectFFmpegPlayer(ffmpeg_path=ffmpeg_path, volume=volume)
     else:
-        logger.info("[KookMusic] 使用推流模式: relay (UDP 中继)")
+        logger.info("[KookMusic] 使用推流模式: relay (PCM 连续推流)")
         return RelayFFmpegPlayer(ffmpeg_path=ffmpeg_path, volume=volume)

@@ -25,3 +25,9 @@ data/
 bili_cookies.txt
 cookies.txt
 *.log
+*.key
+*.enc
+.env
+.env.*
+*.pem
+*.pfx

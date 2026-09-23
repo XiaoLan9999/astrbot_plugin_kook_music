@@ -6,6 +6,8 @@ AstrBot KOOK 语音点歌插件。
 """
 
 import asyncio
+import copy
+import time
 from pathlib import Path
 
 from astrbot.api import logger
@@ -28,6 +30,9 @@ from .music.searcher import MusicSearcher
 from .music.bilibili import BilibiliCollection, BilibiliExtractor
 from .music.playlist_import import PlaylistImporter
 from .playlist_range import looks_like_playlist_range, validate_playlist_range
+from .kook_events import KookEventBridge, enum_value, event_field
+from .kook_permissions import is_guild_admin
+from .music_auth.integration import MusicAuthMixin
 
 # 用户选歌等待映射：session_key -> (songs, future, [msg_ids_to_delete])
 _pending_selections: dict[str, tuple[list[Song], asyncio.Future, list[str]]] = {}
@@ -43,11 +48,7 @@ _playlist_request_commit_lock = asyncio.Lock()
 # 已知的平台标识
 _KNOWN_PLATFORMS = {"netease", "qq", "kugou", "kuwo", "migu", "baidu", "bilibili"}
 
-# 按钮点击回调队列（由 monkey-patch 写入，由 on_message 消费）
-_button_click_queue: asyncio.Queue | None = None
-
-
-class KookMusicPlugin(Star):
+class KookMusicPlugin(MusicAuthMixin, Star):
     """KOOK 语音点歌插件
 
     在 KOOK 平台实现语音频道点歌：
@@ -59,6 +60,8 @@ class KookMusicPlugin(Star):
     - 清空歌单 — 清空队列
     - 退出语音 — 退出频道
     """
+
+    KOOK_ADAPTER_SYNC_INTERVAL = 2.0
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -77,6 +80,7 @@ class KookMusicPlugin(Star):
         self.max_sessions = self.config.get("max_sessions", 5)
         self.volume = self._parse_volume(self.config.get("volume", "0.15"))
         self.streaming_mode = self.config.get("streaming_mode", "relay")
+        self.prefetch_next = self.config.get("prefetch_next", True) is not False
         self.bili_stream_threshold_minutes = self._parse_int_range(
             self.config.get("bili_stream_threshold_minutes", 30),
             30,
@@ -87,6 +91,7 @@ class KookMusicPlugin(Star):
         # 核心组件
         self.data_dir = Path("data/plugin_data/astrbot_plugin_kook_music")
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._configure_music_auth()
 
         self.searcher = MusicSearcher(
             qq_vip_resolver_url=self.config.get(
@@ -97,8 +102,14 @@ class KookMusicPlugin(Star):
                 "qq_vip_resolver_quality",
                 "320",
             ),
+            qq_vip_resolver_backups=self.config.get("qq_vip_resolver_backups", []),
+            qq_vip_resolver_cooldown_seconds=self.config.get(
+                "qq_vip_resolver_cooldown_seconds", 60
+            ),
         )
         self.downloader = MusicDownloader(self.data_dir / "songs")
+        if self._music_auth_enabled:
+            self.searcher.account_resolver = self._resolve_account_audio
         self.bilibili = BilibiliExtractor()
         self.playlist_importer = PlaylistImporter()
         self.voice_manager = VoiceManager(
@@ -107,6 +118,7 @@ class KookMusicPlugin(Star):
             volume=self.volume,
             streaming_mode=self.streaming_mode,
             max_queue_size=self.max_queue_size,
+            prefetch_next=self.prefetch_next,
         )
 
         self.custom_ffmpeg_path = self.config.get("custom_ffmpeg_path", "").strip()
@@ -116,19 +128,19 @@ class KookMusicPlugin(Star):
 
         # 已发送的卡片消息 ID 映射：guild_id -> msg_id（用于播放结束后清理）
         self._card_msg_ids: dict[str, list[str]] = {}
+        self._card_locks: dict[str, asyncio.Lock] = {}
 
         # 后台任务引用（用于 terminate 时取消）
         self._button_handler_task: asyncio.Task | None = None
-
-        # 保存 KOOK 客户端回调，插件热重载/卸载时恢复，避免重复包裹回调。
-        self._patched_kook_client = None
-        self._original_kook_callback = None
-        self._installed_kook_callback = None
+        self._adapter_sync_task: asyncio.Task | None = None
+        self._voice_exit_tasks: set[asyncio.Task] = set()
+        self._button_click_queue = asyncio.Queue()
+        self._adapter_bridge = KookEventBridge(self._handle_kook_system_event)
+        self._token_mismatch_warned = False
 
     async def initialize(self):
         """插件初始化"""
-        global _button_click_queue, _pending_selections, _pending_playlist_ranges
-        _button_click_queue = asyncio.Queue()
+        global _pending_selections, _pending_playlist_ranges
         # 重置全局状态（支持热重载）
         _pending_selections.clear()
         _pending_playlist_ranges.clear()
@@ -139,8 +151,8 @@ class KookMusicPlugin(Star):
         if self._kook_token:
             logger.info("[KookMusic] 已从 AstrBot 配置中获取 KOOK Token")
         else:
-            logger.warning(
-                "[KookMusic] 未找到 KOOK Token，请确保已配置 KOOK 平台适配器"
+            logger.info(
+                "[KookMusic] KOOK 适配器尚未就绪，将在平台启动后自动绑定"
             )
 
         # 自动检查和安装 FFmpeg（如果未手动指定）
@@ -178,11 +190,20 @@ class KookMusicPlugin(Star):
 
         # 启动按钮点击处理循环（保存引用以便 terminate 时取消）
         self._button_handler_task = asyncio.create_task(self._button_click_handler_loop())
+        self._adapter_sync_task = asyncio.create_task(self._kook_adapter_sync_loop())
 
     async def terminate(self):
         """插件卸载清理"""
         logger.info("[KookMusic] 正在清理资源...")
+        if hasattr(self, "_music_auth_lock"):
+            await self._close_music_auth()
+        if self._adapter_sync_task:
+            self._adapter_sync_task.cancel()
+            await asyncio.gather(self._adapter_sync_task, return_exceptions=True)
+            self._adapter_sync_task = None
         self._restore_kook_adapter()
+        if self._voice_exit_tasks:
+            await asyncio.gather(*list(self._voice_exit_tasks), return_exceptions=True)
         for _, future, _ in _pending_selections.values():
             if not future.done():
                 future.cancel()
@@ -210,93 +231,94 @@ class KookMusicPlugin(Star):
         logger.info("[KookMusic] 清理完成")
 
     def _patch_kook_adapter(self):
-        """Monkey-patch KOOK 适配器以拦截按钮点击系统事件。
-
-        关键：必须 patch platform.client.event_callback 而不是 platform._on_received，
-        因为 KookClient 在构造时通过 KookClient(config, self._on_received) 保存了
-        _on_received 的绑定方法引用到 self.event_callback，之后一直调用
-        self.event_callback(data)。替换 platform._on_received 不会影响已经被复制走的引用。
-        """
+        """绑定实际分派回调；冷启动时平台可能尚不存在，后台会持续补装。"""
         try:
-            for platform in self.context.platform_manager.platform_insts:
-                if platform.meta().name != "kook":
-                    continue
-
-                # 获取实际被调用的回调引用
-                if not hasattr(platform, "client") or not hasattr(platform.client, "event_callback"):
-                    logger.warning("[KookMusic] KOOK 适配器结构不符合预期，跳过 patch")
-                    continue
-
-                original_callback = platform.client.event_callback
-
-                async def patched_callback(event, _orig=original_callback):
-                    # 检查是否为按钮点击事件
-                    try:
-                        raw_event_type = getattr(event, "type", None)
-                        event_type = getattr(raw_event_type, "value", raw_event_type)
-                        extra = getattr(event, "extra", None)
-                        raw_extra_type = getattr(extra, "type", None)
-                        extra_type = getattr(raw_extra_type, "value", raw_extra_type)
-                        if event_type == 255 and extra_type == "message_btn_click":
-                            body = getattr(extra, "body", None)
-                            if isinstance(body, dict):
-                                value = body.get("value", "")
-                                if value.startswith("kook_music_"):
-                                    user_id = body.get("user_id", "")
-                                    msg_id = body.get("msg_id", "")
-                                    # KOOK 的按钮事件 body 不包含 guild_id。target_id
-                                    # 才是卡片所在的文字频道，guild_id 稍后由消息/会话映射解析。
-                                    channel_id = body.get("target_id", "") or getattr(
-                                        event, "target_id", ""
-                                    )
-                                    logger.info(
-                                        f"[KookMusic] 收到按钮点击: value={value}, "
-                                        f"user={user_id}, channel={channel_id}, msg={msg_id}"
-                                    )
-                                    if _button_click_queue:
-                                        await _button_click_queue.put({
-                                            "value": value,
-                                            "user_id": user_id,
-                                            "msg_id": msg_id,
-                                            "channel_id": channel_id,
-                                        })
-                    except Exception as e:
-                        logger.debug(f"[KookMusic] 按钮点击检查异常: {e}")
-
-                    # 其他事件照常处理
-                    await _orig(event)
-
-                # patch 实际被调用的回调
-                platform.client.event_callback = patched_callback
-                self._patched_kook_client = platform.client
-                self._original_kook_callback = original_callback
-                self._installed_kook_callback = patched_callback
-                logger.info("[KookMusic] 已注入 KOOK 按钮点击事件处理 (patch event_callback)")
-                return
-
-            logger.warning("[KookMusic] 未找到 KOOK 平台适配器，按钮功能不可用")
+            platforms = list(self.context.platform_manager.platform_insts)
+            self._adapter_bridge.sync(platforms)
+            if not self._kook_token:
+                self._kook_token = self._find_kook_token()
+            tokens = {
+                str(p.config.get("kook_bot_token", "") or "").strip()
+                for p in platforms if p.meta().name == "kook"
+            } - {""}
+            if self._kook_token and tokens and self._kook_token not in tokens:
+                if not self._token_mismatch_warned:
+                    logger.warning(
+                        "[KookMusic] 插件 kook_token 与所有 KOOK 适配器均不匹配，"
+                        "卡片点击无法送达；请使用对应机器人的 Token 或清空插件 kook_token"
+                    )
+                self._token_mismatch_warned = True
+            else:
+                self._token_mismatch_warned = False
         except Exception as e:
-            logger.warning(f"[KookMusic] 注入按钮事件处理失败: {e}")
+            logger.warning(f"[KookMusic] 同步 KOOK 事件监听失败: {type(e).__name__}")
+
+    async def _kook_adapter_sync_loop(self):
+        while True:
+            self._patch_kook_adapter()
+            await self._ensure_music_auth()
+            await asyncio.sleep(self.KOOK_ADAPTER_SYNC_INTERVAL)
 
     def _restore_kook_adapter(self):
-        """仅在回调仍由本插件持有时恢复，避免覆盖其他插件后续的 patch。"""
-        client = self._patched_kook_client
-        if (
-            client is not None
-            and self._original_kook_callback is not None
-            and client.event_callback is self._installed_kook_callback
-        ):
-            client.event_callback = self._original_kook_callback
-        self._patched_kook_client = None
-        self._original_kook_callback = None
-        self._installed_kook_callback = None
+        self._adapter_bridge.close()
+
+    async def _handle_kook_system_event(self, client, event, token: str):
+        if event_field(event, "type") is None and event_field(event, "s") == 0:
+            event = event_field(event, "d")
+        if enum_value(event_field(event, "type")) != 255:
+            return
+        extra = event_field(event, "extra")
+        event_type = enum_value(event_field(extra, "type"))
+        body = event_field(extra, "body")
+        if event_type == "message_btn_click":
+            value = event_field(body, "value", "")
+            if value not in ("kook_music_next", "kook_music_loop", "kook_music_clear"):
+                return
+            self._button_click_queue.put_nowait({
+                "value": value,
+                "msg_id": str(event_field(body, "msg_id", "") or ""),
+                "channel_id": str(event_field(body, "target_id", "") or ""),
+                "user_id": str(event_field(body, "user_id", "") or ""),
+                "token": token,
+            })
+        elif event_type in ("exited_channel", "joined_channel"):
+            bot_id = str(getattr(client, "bot_id", "") or "")
+            if not bot_id or str(event_field(body, "user_id", "")) != bot_id:
+                return
+            channel_id = str(event_field(body, "channel_id", "") or "")
+            if not token or not channel_id:
+                return
+            for session in self.voice_manager.iter_voice_sessions():
+                voice_client = session.voice_client
+                if session.voice_channel_id != channel_id or voice_client.token != token:
+                    continue
+                if event_type == "joined_channel":
+                    voice_client.note_channel_joined(channel_id, event_field(body, "joined_at"))
+                    continue
+                # Cleanup must not block the gateway or wait behind button HTTP replies.
+                task = asyncio.create_task(self._handle_voice_exit(
+                    channel_id, voice_client, event_field(body, "exited_at")
+                ))
+                self._voice_exit_tasks.add(task)
+                task.add_done_callback(self._voice_exit_tasks.discard)
+
+    async def _handle_voice_exit(self, channel_id, voice_client, occurred_at):
+        try:
+            await self.voice_manager.handle_voice_removed(
+                channel_id, expected_voice_client=voice_client, occurred_at=occurred_at
+            )
+        except Exception as exc:
+            logger.error(f"[KookMusic] 语音退出清理失败: {type(exc).__name__}")
 
     def _resolve_button_guild_id(self, msg_id: str, channel_id: str) -> str:
         """从播放卡片消息或活跃文字频道反查服务器 ID。"""
         if msg_id:
             for guild_id, msg_ids in self._card_msg_ids.items():
                 if msg_id in msg_ids:
-                    return guild_id
+                    session = self.voice_manager.sessions.get(guild_id)
+                    if session and (not channel_id or session.text_channel_id == channel_id):
+                        return guild_id
+                    return ""
 
         if channel_id:
             matches = [
@@ -312,46 +334,68 @@ class KookMusicPlugin(Star):
         """后台循环处理按钮点击事件"""
         while True:
             try:
-                if not _button_click_queue:
-                    await asyncio.sleep(1)
-                    continue
-
-                click_data = await _button_click_queue.get()
-                value = click_data.get("value", "")
-                channel_id = click_data.get("channel_id", "")
-                msg_id = click_data.get("msg_id", "")
-                guild_id = self._resolve_button_guild_id(msg_id, channel_id)
-
-                if not guild_id:
-                    logger.warning(
-                        f"[KookMusic] 无法定位按钮所属服务器: msg={msg_id}, "
-                        f"channel={channel_id}, value={value}"
-                    )
-                    continue
-
-                if value == "kook_music_next":
-                    ok, msg = await self.voice_manager.skip(guild_id)
-                    reply = f"{'✅' if ok else '❌'} {msg}"
-                elif value == "kook_music_loop":
-                    ok, msg = await self.voice_manager.toggle_loop(guild_id)
-                    reply = f"🔁 {msg}"
-                elif value == "kook_music_clear":
-                    ok, msg = await self.voice_manager.clear_playlist(guild_id)
-                    reply = f"{'✅' if ok else '❌'} {msg}"
-                else:
-                    continue
-
-                # 使用 KOOK API 直接回复到频道
-                if self._kook_token and channel_id:
-                    await send_text_message(
-                        self._kook_token, channel_id, reply
-                    )
-
+                click_data = await self._button_click_queue.get()
+                try:
+                    await self._handle_button_click(click_data)
+                finally:
+                    self._button_click_queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"[KookMusic] 按钮处理异常: {e}")
-                await asyncio.sleep(1)
+
+    async def _handle_button_click(self, click_data):
+        value = click_data.get("value", "")
+        channel_id = click_data.get("channel_id", "")
+        msg_id = click_data.get("msg_id", "")
+        guild_id = self._resolve_button_guild_id(msg_id, channel_id)
+        session = self.voice_manager.sessions.get(guild_id)
+        if not session:
+            return
+        token = click_data.get("token", "")
+        if not token or token != session.voice_client.token:
+            return
+        channel_id = session.text_channel_id
+        action = {
+            "kook_music_next": "next",
+            "kook_music_loop": "loop",
+            "kook_music_clear": "clear",
+        }.get(value)
+        if not action:
+            return
+        ok, msg = await self._control_playback(
+            guild_id, click_data.get("user_id", ""), action,
+            expected_session=session,
+        )
+        reply = f"{'✅' if ok else '❌'} {msg}"
+        if channel_id:
+            await send_text_message(token, channel_id, reply)
+
+    async def _control_playback(
+        self, guild_id: str, user_id: str, action: str,
+        *, expected_session=None, position: int | None = None,
+    ) -> tuple[bool, str]:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return False, "无法识别操作者，已拒绝控制请求"
+        session = self.voice_manager.sessions.get(guild_id)
+        if session is None:
+            return False, "当前没有可控制的语音会话"
+        if expected_session is not None and session is not expected_session:
+            return False, "播放会话已变化，请使用最新卡片重试"
+        song = VoiceManager.control_song(session)
+        requester_id = str(song.requester_id or "") if song is not None else ""
+        admin = False
+        if user_id != requester_id:
+            admin = await is_guild_admin(session.voice_client.token, guild_id, user_id)
+            if not admin:
+                return False, "仅当前歌曲的点歌者或 KOOK 服务器管理员可操作"
+        # The manager rechecks ownership after taking its lock: an API lookup or
+        # an earlier skip may have moved playback to a different user's song.
+        return await self.voice_manager.control(
+            guild_id, action, actor_id=user_id, is_admin=admin,
+            expected_session=session, position=position,
+        )
 
     def _find_kook_token(self) -> str:
         """获取 KOOK Token（优先插件配置，其次从平台适配器实例获取）"""
@@ -396,7 +440,10 @@ class KookMusicPlugin(Star):
 
     def _is_kook(self, event: AstrMessageEvent) -> bool:
         """检查是否为 KOOK 平台"""
-        return event.get_platform_name() == "kook"
+        if event.get_platform_name() != "kook":
+            return False
+        self._patch_kook_adapter()
+        return True
 
     def _get_guild_id(self, event: AstrMessageEvent) -> str:
         """从事件中提取 guild_id"""
@@ -413,6 +460,30 @@ class KookMusicPlugin(Star):
         return event.message_obj.group_id or event.message_obj.session_id or ""
 
     # ========== 命令注册 ==========
+
+    @filter.command("音乐登录")
+    async def on_music_login(self, event: AstrMessageEvent):
+        reply = await self._music_auth_command(event, "音乐登录")
+        if reply is not None:
+            await event.send(event.plain_result(reply))
+
+    @filter.command("音乐账号状态")
+    async def on_music_account_status(self, event: AstrMessageEvent):
+        reply = await self._music_auth_command(event, "音乐账号状态")
+        if reply is not None:
+            await event.send(event.plain_result(reply))
+
+    @filter.command("取消音乐登录")
+    async def on_music_login_cancel(self, event: AstrMessageEvent):
+        reply = await self._music_auth_command(event, "取消音乐登录")
+        if reply is not None:
+            await event.send(event.plain_result(reply))
+
+    @filter.command("退出音乐账号")
+    async def on_music_account_logout(self, event: AstrMessageEvent):
+        reply = await self._music_auth_command(event, "退出音乐账号")
+        if reply is not None:
+            await event.send(event.plain_result(reply))
 
     @filter.command("点歌")
     async def on_play_music(self, event: AstrMessageEvent):
@@ -525,6 +596,11 @@ class KookMusicPlugin(Star):
                 yield event.plain_result(
                     f"❌ 无法从该链接取得{platform_label}歌曲 ID 或歌曲信息"
                 )
+                return
+            if not song.audio_url and not song.playback_source:
+                # Direct-link resolution already tried the configured providers;
+                # do not immediately repeat the same timeout in _play_song.
+                yield event.plain_result(self._unplayable_message(song))
                 return
 
             await self._play_song(event, song, guild_id)
@@ -648,7 +724,7 @@ class KookMusicPlugin(Star):
         if not self._is_kook(event):
             return
         guild_id = self._get_guild_id(event)
-        ok, msg = await self.voice_manager.skip(guild_id)
+        ok, msg = await self._control_playback(guild_id, event.get_sender_id(), "next")
         yield event.plain_result(f"{'✅' if ok else '❌'} {msg}")
 
     @filter.command("歌单")
@@ -692,7 +768,9 @@ class KookMusicPlugin(Star):
             yield event.plain_result("❌ 序号必须是播放队列中的数字，例如：队列插队 10")
             return
 
-        ok, msg = await self.voice_manager.move_to_next(guild_id, int(parts[0]))
+        ok, msg = await self._control_playback(
+            guild_id, event.get_sender_id(), "move", position=int(parts[0])
+        )
         yield event.plain_result(f"{'✅' if ok else '❌'} {msg}")
 
     @filter.command("循环模式")
@@ -701,8 +779,8 @@ class KookMusicPlugin(Star):
         if not self._is_kook(event):
             return
         guild_id = self._get_guild_id(event)
-        ok, msg = await self.voice_manager.toggle_loop(guild_id)
-        yield event.plain_result(f"🔁 {msg}")
+        ok, msg = await self._control_playback(guild_id, event.get_sender_id(), "loop")
+        yield event.plain_result(f"{'🔁' if ok else '❌'} {msg}")
 
     @filter.command("清空歌单")
     async def on_clear(self, event: AstrMessageEvent):
@@ -710,7 +788,7 @@ class KookMusicPlugin(Star):
         if not self._is_kook(event):
             return
         guild_id = self._get_guild_id(event)
-        ok, msg = await self.voice_manager.clear_playlist(guild_id)
+        ok, msg = await self._control_playback(guild_id, event.get_sender_id(), "clear")
         yield event.plain_result(f"{'✅' if ok else '❌'} {msg}")
 
     @filter.command("退出语音")
@@ -719,8 +797,9 @@ class KookMusicPlugin(Star):
         if not self._is_kook(event):
             return
         guild_id = self._get_guild_id(event)
-        await self._delete_card(guild_id)
-        ok, msg = await self.voice_manager.leave(guild_id)
+        ok, msg = await self._control_playback(guild_id, event.get_sender_id(), "leave")
+        if ok:
+            await self._delete_card(guild_id)
         yield event.plain_result(f"{'✅' if ok else '❌'} {msg}")
 
     @filter.command("播放")
@@ -1082,27 +1161,82 @@ class KookMusicPlugin(Star):
             asyncio.create_task(delete_message(self._kook_token, user_msg_id))
         event.stop_event()
 
-    async def _send_card(self, channel_id: str, guild_id: str, card_data: dict) -> str | None:
+    async def _send_card(
+        self, channel_id: str, guild_id: str, card_data: dict,
+        expected_session=None, expected_song=None,
+    ) -> str | None:
         """发送卡片并记录 msg_id（先删旧卡片再发新卡片）"""
-        # 先删除旧卡片；删除失败时保留 msg_id，下次继续补删，避免长队列播放时残留累积。
-        old_msg_ids = self._card_msg_ids.pop(guild_id, [])
-        failed_msg_ids = await self._delete_card_messages(old_msg_ids)
+        def still_current():
+            return expected_session is None or (
+                self.voice_manager.sessions.get(guild_id) is expected_session
+                and expected_session.current_song is expected_song
+                and expected_session.is_playing
+            )
 
-        # 发送新卡片
-        msg_id = await send_card_message(self._kook_token, channel_id, card_data)
-        tracked_msg_ids = failed_msg_ids
-        if msg_id:
-            tracked_msg_ids.append(msg_id)
-        if tracked_msg_ids:
-            self._card_msg_ids[guild_id] = tracked_msg_ids
-        return msg_id
+        lock = self._card_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            if not still_current():
+                return None
+            old_msg_ids = list(self._card_msg_ids.get(guild_id, []))
+            failed_msg_ids = await self._delete_card_messages(old_msg_ids)
+            if failed_msg_ids:
+                self._card_msg_ids[guild_id] = failed_msg_ids
+            else:
+                self._card_msg_ids.pop(guild_id, None)
+            if not still_current():
+                return None
+            started_at = getattr(expected_session, "playback_started_at", 0.0)
+            if started_at and expected_song is not None and expected_song.duration > 0:
+                elapsed = max(0.0, time.monotonic() - started_at)
+                elapsed += getattr(expected_session, "playback_offset_seconds", 0.0)
+                remaining_ms = max(1000, expected_song.duration - int(elapsed * 1000))
+                card_data = copy.deepcopy(card_data)
+                now_ms = int(time.time() * 1000)
+                for module in card_data.get("modules", []):
+                    if module.get("type") == "countdown":
+                        module["startTime"] = now_ms
+                        module["endTime"] = now_ms + remaining_ms
+            send_task = asyncio.create_task(
+                send_card_message(self._kook_token, channel_id, card_data)
+            )
+            try:
+                msg_id = await asyncio.shield(send_task)
+            except asyncio.CancelledError:
+                # The server may have accepted the POST; recover its ID before
+                # cleanup instead of abandoning an untracked "playing" card.
+                try:
+                    msg_id = await send_task
+                except Exception:
+                    msg_id = None
+                if msg_id:
+                    failed_msg_ids.extend(await self._delete_card_messages([msg_id]))
+                    if failed_msg_ids:
+                        self._card_msg_ids[guild_id] = failed_msg_ids
+                raise
+            if msg_id:
+                if still_current():
+                    failed_msg_ids.append(msg_id)
+                else:
+                    failed_msg_ids.extend(await self._delete_card_messages([msg_id]))
+                    msg_id = None
+                if failed_msg_ids:
+                    self._card_msg_ids[guild_id] = failed_msg_ids
+            return msg_id
 
     async def _delete_card(self, guild_id: str):
         """删除已发送的卡片消息"""
-        msg_ids = self._card_msg_ids.pop(guild_id, [])
-        failed_msg_ids = await self._delete_card_messages(msg_ids)
-        if failed_msg_ids:
-            self._card_msg_ids[guild_id] = failed_msg_ids
+        lock = self._card_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            session = self.voice_manager.sessions.get(guild_id)
+            if session and session.playlist:
+                return
+            # Wait for any in-flight send so a late HTTP response cannot revive the card.
+            msg_ids = list(self._card_msg_ids.get(guild_id, []))
+            failed_msg_ids = await self._delete_card_messages(msg_ids)
+            if failed_msg_ids:
+                self._card_msg_ids[guild_id] = failed_msg_ids
+            else:
+                self._card_msg_ids.pop(guild_id, None)
 
     async def _delete_card_messages(self, msg_ids: list[str]) -> list[str]:
         """删除播放卡片消息，返回仍未删除成功的 msg_id。"""
@@ -1187,7 +1321,7 @@ class KookMusicPlugin(Star):
         """完整播放流程：获取URL → 按需下载 → 加入频道 → 播放/入队
 
         如果当前没有歌曲在播放，立即下载并播放。
-        如果已有歌曲在播放，仅加入队列（不下载），由播放循环在轮到时下载。
+        如果已有歌曲在播放，仅加入队列；由后台预准备或队首准备负责下载。
         """
         # 填充请求者信息
         song.requester_id = event.get_sender_id()
@@ -1200,7 +1334,7 @@ class KookMusicPlugin(Star):
         )
 
         if has_active_queue:
-            # ---- 已在播放：仅入队，不下载 ----
+            # ---- 已在播放：此处仅入队，由播放管理器最多预准备下一首 ----
             # 但仍然需要先获取音频 URL（用于元数据展示）
             if not song.audio_url:
                 song = await self.searcher.fetch_audio_url(song)
@@ -1542,4 +1676,7 @@ class KookMusicPlugin(Star):
             now_card = card_builder.build_bilibili_playing_card(song, queue_size, loop_mode)
         else:
             now_card = card_builder.build_now_playing_card(song, queue_size, loop_mode)
-        await self._send_card(text_channel_id, guild_id, now_card)
+        await self._send_card(
+            text_channel_id, guild_id, now_card,
+            expected_session=session, expected_song=song,
+        )

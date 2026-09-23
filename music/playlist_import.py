@@ -148,9 +148,8 @@ class PlaylistImporter:
         if not text:
             return "netease", ""
 
-        url_match = re.search(r"https?://[^\s]+", text, re.IGNORECASE)
-        if url_match:
-            url = url_match.group(0).rstrip(",.;，。；>)]】）")
+        url = MusicSearcher._extract_http_url(text)
+        if url:
             parsed = urlparse(url)
             host = (parsed.hostname or "").lower()
             path_and_fragment = f"{parsed.path}#{parsed.fragment}"
@@ -263,10 +262,9 @@ class PlaylistImporter:
         if parsed[1]:
             return parsed
 
-        url_match = re.search(r"https?://[^\s]+", text, re.IGNORECASE)
-        if not url_match:
+        current_url = MusicSearcher._extract_http_url(text)
+        if not current_url:
             return parsed
-        current_url = url_match.group(0).rstrip(",.;，。；>)]】）")
         initial_url = urlparse(current_url)
         host = (initial_url.hostname or "").lower()
         if initial_url.scheme.lower() != "https" or not self._host_matches(
@@ -466,12 +464,7 @@ class PlaylistImporter:
         )
         return Song(
             id=song_id,
-            name=str(
-                item.get("name", "")
-                or item.get("songname", "")
-                or item.get("title", "")
-                or "已下架歌曲"
-            ),
+            name=MusicSearcher._qq_track_title(item, "已下架歌曲"),
             artists=artists or "未知歌手",
             platform="qq",
             extra_headers=dict(MusicSearcher.QQ_AUDIO_HEADERS),

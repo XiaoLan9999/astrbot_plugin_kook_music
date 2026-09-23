@@ -3,7 +3,9 @@
 管理多个 Guild 的语音连接、播放队列和生命周期。
 """
 import asyncio
+import copy
 import logging
+import math
 import random
 import time
 from dataclasses import dataclass, field
@@ -23,6 +25,14 @@ logger = logging.getLogger("astrbot")
 
 
 @dataclass
+class SongPrefetch:
+    original: Song
+    candidate: Song
+    task: asyncio.Task | None = field(default=None, repr=False)
+    discarded: bool = False
+
+
+@dataclass
 class GuildSession:
     """单个服务器的语音会话"""
     guild_id: str
@@ -38,7 +48,14 @@ class GuildSession:
     needs_direct_refresh: bool = False
     pending_skips: int = 0
     playback_retry_count: int = 0
+    playback_started_at: float = 0.0
+    playback_offset_seconds: float = 0.0
     preparation_task: asyncio.Task | None = field(default=None, repr=False)
+    prefetch: SongPrefetch | None = field(default=None, repr=False)
+    prefetch_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
+    notification_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
+    removal_requested: bool = False
+    initialization_done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     @property
     def current_song(self) -> Song | None:
@@ -61,7 +78,7 @@ class VoiceManager:
 
     # FFmpeg 播放超时额外缓冲（秒）
     PLAYBACK_TIMEOUT_BUFFER = 30
-    PLAYBACK_START_DELAY = 1.0
+    PLAYBACK_START_DELAY = 0.0
     DIRECT_RECONNECT_DELAY = 0.5
     PLAYBACK_RETRY_DELAY = 5.0
     MAX_PLAYBACK_RETRIES = 3
@@ -79,6 +96,7 @@ class VoiceManager:
         ffmpeg_path: str = "ffmpeg",
         streaming_mode: str = "relay",
         max_queue_size: int = 50,
+        prefetch_next: bool = True,
     ):
         self.max_sessions = max_sessions
         self.auto_leave_timeout = auto_leave_timeout
@@ -86,18 +104,82 @@ class VoiceManager:
         self.ffmpeg_path = ffmpeg_path
         self.streaming_mode = streaming_mode  # "direct" or "relay"
         self.max_queue_size = max_queue_size
+        self.prefetch_next = prefetch_next
         self.sessions: dict[str, GuildSession] = {}
+        self._pending_sessions: dict[str, GuildSession] = {}
+        self._initialization_tasks: dict[str, asyncio.Task] = {}
         self._playback_tasks: dict[str, asyncio.Task] = {}
         self._retry_tasks: dict[str, asyncio.Task] = {}
         self._guild_locks: dict[str, asyncio.Lock] = {}
         self._session_creation_lock = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
+        self._closing = False
         self.on_playback_finished: callable = None  # 回调：播放全部完成时调用
         self.on_song_started: callable = None  # 回调：新歌曲开始播放时调用 (guild_id, song)
         self.on_download_song: callable = None  # 回调：下载歌曲 async (Song) -> Song
 
     def get_session(self, guild_id: str) -> GuildSession | None:
         return self.sessions.get(guild_id)
+
+    @staticmethod
+    def control_song(session: GuildSession) -> Song | None:
+        """已排队跳过的歌曲不再授予下一次控制权限。"""
+        index = session.pending_skips
+        if 0 <= index < len(session.playlist):
+            return session.playlist[index]
+        return None
+
+    async def control(
+        self,
+        guild_id: str,
+        action: str,
+        *,
+        actor_id: str,
+        is_admin: bool = False,
+        expected_session: GuildSession | None = None,
+        position: int | None = None,
+    ) -> tuple[bool, str]:
+        """在执行前原子检查当前点歌者，供按钮及文字命令共用。"""
+        lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            session = self.sessions.get(guild_id)
+            if not session:
+                return False, "Bot 不在语音频道中"
+            if expected_session is not None and session is not expected_session:
+                return False, "播放会话已变化，请重新操作"
+            actor_id = str(actor_id or "").strip()
+            if not actor_id:
+                return False, "无法确认操作用户，已拒绝操作"
+            song = self.control_song(session)
+            requester_id = str(song.requester_id or "").strip() if song else ""
+            if is_admin is not True and (
+                not requester_id or actor_id != requester_id
+            ):
+                return False, "只有当前歌曲的点歌者或管理员可以调整播放"
+            if session.pending_skips > 0 and action in {"move", "clear"}:
+                return False, "正在切换歌曲，请稍后再调整队列"
+
+            # 下列入口在首个 await 前完成状态变更；鉴权到提交之间不能让出执行权。
+            if action == "next":
+                return await self.skip(guild_id)
+            if action == "loop":
+                return await self.toggle_loop(guild_id)
+            if action == "clear":
+                return await self.clear_playlist(guild_id)
+            if action == "move":
+                if not isinstance(position, int) or isinstance(position, bool):
+                    return False, "请提供有效的歌曲序号"
+                return await self.move_to_next(guild_id, position)
+            if action == "leave":
+                await self._cleanup_session(guild_id, expected_session=session)
+                return True, "已退出语音频道"
+            return False, "未知的播放操作"
+
+    def iter_voice_sessions(self) -> tuple[GuildSession, ...]:
+        """包括仍在连接或启动中继的会话，供网关事件按 Token/频道路由。"""
+        combined = dict(self._pending_sessions)
+        combined.update(self.sessions)
+        return tuple(combined.values())
 
     async def get_user_voice_channel(
         self, token: str, guild_id: str, user_id: str
@@ -166,6 +248,8 @@ class VoiceManager:
 
         lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
         async with lock:
+            if self._closing:
+                return False, "插件正在卸载，无法开始播放"
             session = self.sessions.get(guild_id)
             if session and not session.is_playing and not session.playlist:
                 logger.info("[KookMusic] 检测到空闲旧会话，重新建立语音会话")
@@ -188,6 +272,7 @@ class VoiceManager:
                 if not session.is_playing:
                     self._start_playback_loop(guild_id)
                     return True, f"开始播放，共加入 {len(songs)} 首"
+                self._sync_prefetch(session)
                 if len(songs) == 1:
                     return True, (
                         f"QUEUED:已添加到队列第 {start_pos} 位："
@@ -216,19 +301,22 @@ class VoiceManager:
     ) -> tuple[bool, str]:
         """串行创建新会话，并在初始化完全成功后才对外发布。"""
         async with self._session_creation_lock:
+            if self._closing:
+                return False, "插件正在卸载，无法开始播放"
             if len(self.sessions) >= self.max_sessions:
                 return False, f"播放槽位已满（最大 {self.max_sessions}）"
 
             voice_client = VoiceClient(token)
+            voice_client.on_remote_removed = (
+                lambda removed_client: self.handle_voice_removed(
+                    voice_channel_id, expected_voice_client=removed_client
+                )
+            )
             ffmpeg_player = create_player(
                 mode=self.streaming_mode,
                 ffmpeg_path=self.ffmpeg_path,
                 volume=self.volume,
             )
-            connected = await voice_client.connect(voice_channel_id)
-            if not connected:
-                return False, "无法连接语音频道"
-
             session = GuildSession(
                 guild_id=guild_id,
                 voice_channel_id=voice_channel_id,
@@ -237,7 +325,38 @@ class VoiceManager:
                 ffmpeg_player=ffmpeg_player,
                 playlist=list(songs),
             )
+            self._pending_sessions[guild_id] = session
+            task = asyncio.create_task(self._initialize_voice_session(session))
+            self._initialization_tasks[guild_id] = task
+            try:
+                return await task
+            except asyncio.CancelledError:
+                if getattr(voice_client, "remote_removed", False):
+                    return False, "机器人已被移出语音频道，播放已结束"
+                raise
+            finally:
+                try:
+                    # 在首次执行前被取消的初始化任务不会进入它自身的 finally。
+                    if task.cancelled():
+                        await self._stop_session_resources(session)
+                finally:
+                    if self._pending_sessions.get(guild_id) is session:
+                        self._pending_sessions.pop(guild_id)
+                    if self._initialization_tasks.get(guild_id) is task:
+                        self._initialization_tasks.pop(guild_id)
+                    session.initialization_done.set()
 
+    async def _initialize_voice_session(self, session: GuildSession) -> tuple[bool, str]:
+        voice_client = session.voice_client
+        ffmpeg_player = session.ffmpeg_player
+        removed_message = "机器人已被移出语音频道，播放已结束"
+        published = False
+        try:
+            connected = await voice_client.connect(session.voice_channel_id)
+            if not connected:
+                if getattr(voice_client, "remote_removed", False):
+                    return False, removed_message
+                return False, "无法连接语音频道"
             if isinstance(ffmpeg_player, RelayFFmpegPlayer):
                 relay_ok = await ffmpeg_player.start_relay(
                     voice_client.rtp_url, voice_client.ssrc
@@ -249,10 +368,23 @@ class VoiceManager:
                     )
                     session.ffmpeg_player = ffmpeg_player
 
-            self.sessions[guild_id] = session
-            self._start_playback_loop(guild_id)
+            if getattr(voice_client, "remote_removed", False):
+                return False, removed_message
+            if self._closing:
+                return False, "插件正在卸载，无法开始播放"
+
+            self.sessions[session.guild_id] = session
+            self._start_playback_loop(session.guild_id)
             self._ensure_idle_check()
-            return True, f"已加入语音频道，开始播放，共加入 {len(songs)} 首"
+            published = True
+            return True, f"已加入语音频道，开始播放，共加入 {len(session.playlist)} 首"
+        except asyncio.CancelledError:
+            if getattr(voice_client, "remote_removed", False):
+                return False, removed_message
+            raise
+        finally:
+            if not published:
+                await self._stop_session_resources(session)
 
     def _start_playback_loop(self, guild_id: str):
         """启动或重启播放循环"""
@@ -285,6 +417,8 @@ class VoiceManager:
         session.idle_seconds = 0
         if not session.is_playing:
             self._start_playback_loop(guild_id)
+        else:
+            self._sync_prefetch(session)
         return True, f"已添加到队列第 {pos} 位"
 
     async def skip(self, guild_id: str) -> tuple[bool, str]:
@@ -297,6 +431,8 @@ class VoiceManager:
         if session.pending_skips >= len(session.playlist):
             return False, "没有更多可跳过的歌曲"
         session.pending_skips += 1
+        if session.pending_skips > 1:
+            self._cancel_prefetch(session)
         if not session.is_playing:
             self._start_playback_loop(guild_id)
         preparation_task = session.preparation_task
@@ -324,6 +460,7 @@ class VoiceManager:
 
         song = session.playlist.pop(position - 1)
         session.playlist.insert(1, song)
+        self._sync_prefetch(session)
         return True, f"已将第 {position} 首插队到下一首：{song.display_name}"
 
     async def clear_playlist(self, guild_id: str) -> tuple[bool, str]:
@@ -331,6 +468,7 @@ class VoiceManager:
         session = self.sessions.get(guild_id)
         if not session:
             return False, "Bot 不在语音频道中"
+        self._cancel_prefetch(session)
         if len(session.playlist) > 1:
             current = session.playlist[0]
             removed = session.playlist[1:]
@@ -347,6 +485,7 @@ class VoiceManager:
         if not session:
             return False, "Bot 不在语音频道中"
         session.loop_mode = (session.loop_mode + 1) % 4
+        self._sync_prefetch(session)
         return True, f"循环模式: {session.loop_mode_name}"
 
     async def leave(self, guild_id: str) -> tuple[bool, str]:
@@ -361,6 +500,13 @@ class VoiceManager:
 
     async def leave_all(self):
         """退出所有语音频道（插件卸载时调用）"""
+        self._closing = True
+        initialization_tasks = list(self._initialization_tasks.values())
+        for task in initialization_tasks:
+            if not task.done():
+                task.cancel()
+        if initialization_tasks:
+            await asyncio.gather(*initialization_tasks, return_exceptions=True)
         guild_ids = list(self.sessions.keys())
         for gid in guild_ids:
             await self.leave(gid)
@@ -371,6 +517,76 @@ class VoiceManager:
             except (asyncio.CancelledError, Exception):
                 pass
         self._idle_task = None
+
+    async def handle_voice_removed(
+        self,
+        channel_id: str,
+        expected_voice_client: VoiceClient | None = None,
+        occurred_at: float | None = None,
+    ) -> bool:
+        """处理已确认属于机器人的远端退出；旧连接通知不得关闭新会话。"""
+        for session in self.iter_voice_sessions():
+            guild_id = session.guild_id
+            if session.voice_channel_id != str(channel_id):
+                continue
+            client = session.voice_client
+            if expected_voice_client is not None and client is not expected_voice_client:
+                continue
+            if not getattr(client, "remote_removed", False):
+                consume_exit = getattr(client, "consume_expected_exit", None)
+                if consume_exit and consume_exit(channel_id, occurred_at):
+                    logger.debug("[KookMusic] 忽略正常语音重连引起的退出事件")
+                    continue
+            if (
+                self._pending_sessions.get(guild_id) is session
+                and self.sessions.get(guild_id) is not session
+            ):
+                if session.removal_requested:
+                    return False
+                session.removal_requested = True
+                mark_removed = getattr(client, "mark_remote_removed", None)
+                if mark_removed:
+                    mark_removed()
+                initialization_task = self._initialization_tasks.get(guild_id)
+                if (
+                    initialization_task
+                    and initialization_task is not asyncio.current_task()
+                    and not initialization_task.done()
+                ):
+                    initialization_task.cancel()
+                    await asyncio.gather(initialization_task, return_exceptions=True)
+                if initialization_task is not asyncio.current_task():
+                    await session.initialization_done.wait()
+                    lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
+                    async with lock:
+                        # 旧初始化的完成通知不能删除随后新点歌创建的卡片。
+                        if guild_id not in self.sessions and guild_id not in self._pending_sessions:
+                            await self._notify_voice_removed(guild_id)
+                else:
+                    await self._notify_voice_removed(guild_id)
+                return True
+            lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
+            async with lock:
+                if self.sessions.get(guild_id) is not session:
+                    continue
+                # 先使重连失效，再取消正在播放、准备或等待重试的任务。
+                mark_removed = getattr(client, "mark_remote_removed", None)
+                if mark_removed:
+                    mark_removed()
+                await self._cleanup_session(guild_id, expected_session=session)
+                await self._notify_voice_removed(guild_id)
+                return True
+        return False
+
+    async def _notify_voice_removed(self, guild_id: str):
+        if self.on_playback_finished:
+            try:
+                result = self.on_playback_finished(guild_id)
+                if asyncio.isfuture(result) or asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.debug(f"[KookMusic] 远端退出完成回调异常: {exc}")
+        logger.info(f"[KookMusic] 机器人已被移出语音频道，播放已结束: {guild_id}")
 
     def get_playlist_text(self, guild_id: str) -> str:
         """获取播放队列文本"""
@@ -435,6 +651,8 @@ class VoiceManager:
 
     async def _ensure_voice_alive(self, session: GuildSession) -> bool:
         """确保语音连接仍然存活，否则尝试重连"""
+        if getattr(session.voice_client, "remote_removed", False):
+            return False
         if session.voice_client.is_alive:
             return True
 
@@ -467,6 +685,8 @@ class VoiceManager:
         队列播空后 KOOK 侧旧 Transport/Producer 可能仍占用混音输出，
         直接复用会表现为歌曲流程正常但没有声音。恢复播放前刷新 RTP 并重建中继。
         """
+        if getattr(session.voice_client, "remote_removed", False):
+            return False
         player = session.ffmpeg_player
         if not isinstance(player, RelayFFmpegPlayer):
             return True
@@ -499,6 +719,149 @@ class VoiceManager:
         session.needs_relay_refresh = False
         return True
 
+    def _cancel_prefetch(self, session: GuildSession):
+        state = session.prefetch
+        if state is None:
+            return
+        session.prefetch = None
+        state.discarded = True
+        task = state.task
+        if task is not None and not task.done():
+            task.cancel()
+            return
+        result = None
+        if task is not None and not task.cancelled():
+            try:
+                result = task.result()
+            except Exception:
+                pass
+        self._cleanup_song_file(state.candidate)
+        if result is not None and result is not state.candidate:
+            self._cleanup_song_file(result)
+
+    def _sync_prefetch(self, session: GuildSession):
+        target = None
+        if (
+            self.prefetch_next
+            and not self._closing
+            and self.sessions.get(session.guild_id) is session
+            and session.is_playing
+            and session.loop_mode in (0, 2)
+            and session.pending_skips <= 1
+            and len(session.playlist) > 1
+            and self.on_download_song
+        ):
+            next_song = session.playlist[1]
+            if next_song.platform != "bilibili" and not next_song.playback_source:
+                target = next_song
+        if session.prefetch and session.prefetch.original is target:
+            return
+        self._cancel_prefetch(session)
+        if (
+            target is None
+            or not session.ffmpeg_player.is_playing
+            or session.prefetch_tasks
+        ):
+            return
+
+        # Keep background mutation and abandoned downloads out of the live queue.
+        state = SongPrefetch(target, copy.deepcopy(target))
+        session.prefetch = state
+        task = asyncio.create_task(self._prefetch_song(session, state))
+        state.task = task
+        session.prefetch_tasks.add(task)
+
+        def completed(done_task):
+            session.prefetch_tasks.discard(done_task)
+            if not done_task.cancelled():
+                done_task.exception()
+            # A replaced target waits for cancellation to finish before another
+            # download can start; at most one background prepare per session.
+            if session.prefetch is None and session.ffmpeg_player.is_playing:
+                self._sync_prefetch(session)
+
+        task.add_done_callback(completed)
+
+    async def _prefetch_song(self, session: GuildSession, state: SongPrefetch):
+        result = None
+        retained = False
+        try:
+            logger.info(f"[KookMusic] 后台预准备下一首: {state.original.name}")
+            result = await self.on_download_song(state.candidate)
+            if result is not None:
+                result.requester_id = state.original.requester_id
+                result.requester_name = state.original.requester_name
+                result.provider_data = {
+                    **copy.deepcopy(state.original.provider_data),
+                    **result.provider_data,
+                }
+            retained = (
+                not state.discarded
+                and self.sessions.get(session.guild_id) is session
+                and result is not None
+                and bool(result.playback_source)
+            )
+            if state.discarded or self.sessions.get(session.guild_id) is not session:
+                return None
+            status = "就绪" if retained else "未取得可播放音频"
+            logger.info(f"[KookMusic] 下一首预准备{status}: {state.original.name}")
+            return result
+        finally:
+            if not retained:
+                self._cleanup_song_file(state.candidate)
+                if result is not None and result is not state.candidate:
+                    self._cleanup_song_file(result)
+            elif (
+                result is not state.candidate
+                and state.candidate.file_path != result.file_path
+            ):
+                self._cleanup_song_file(state.candidate)
+
+    def _take_prefetch(self, session: GuildSession, song: Song):
+        state = session.prefetch
+        if state is not None and state.original is song:
+            session.prefetch = None
+            return state.task
+        self._cancel_prefetch(session)
+        return None
+
+    def _cleanup_unused_preparation(self, session: GuildSession, task: asyncio.Task):
+        if not task.done() or task.cancelled():
+            return
+        try:
+            result = task.result()
+        except Exception:
+            return
+        if result is not None and not any(song is result for song in session.playlist):
+            self._cleanup_song_file(result)
+
+    def _schedule_song_notification(self, session: GuildSession, song: Song):
+        if not self.on_song_started or song.provider_data.get(self._STREAM_NOTIFIED_KEY):
+            return
+        song.provider_data[self._STREAM_NOTIFIED_KEY] = True
+        queue_size = len(session.playlist)
+        loop_name = session.loop_mode_name
+
+        async def notify():
+            try:
+                if (
+                    self.sessions.get(session.guild_id) is not session
+                    or session.current_song is not song
+                    or session.pending_skips > 0
+                ):
+                    return
+                result = self.on_song_started(
+                    session.guild_id, song, queue_size, loop_name
+                )
+                if asyncio.isfuture(result) or asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.debug(f"[KookMusic] 歌曲开始回调异常: {exc}")
+
+        task = asyncio.create_task(notify())
+        session.notification_tasks.add(task)
+        task.add_done_callback(session.notification_tasks.discard)
+
     async def _playback_loop(self, guild_id: str):
         """播放循环：依次播放队列中的歌曲
 
@@ -516,10 +879,10 @@ class VoiceManager:
 
         session.is_playing = True
         try:
-            while guild_id in self.sessions:
-                # 每次迭代重新获取 session，防止引用悬垂
-                session = self.sessions.get(guild_id)
-                if not session or not session.playlist:
+            while self.sessions.get(guild_id) is session:
+                if not session.playlist or getattr(
+                    session.voice_client, "remote_removed", False
+                ):
                     break
 
                 # 连续点击切歌时，每次点击都对应丢弃一首。尚未开始下载/播放的
@@ -534,15 +897,18 @@ class VoiceManager:
                 if not song.playback_source:
                     if self.on_download_song:
                         preparing_session = session
-                        preparation_task = asyncio.create_task(
-                            self.on_download_song(song)
-                        )
+                        preparation_task = self._take_prefetch(session, song)
+                        preparation_label = "接管下一首预准备" if preparation_task else "开始准备队列歌曲"
+                        if preparation_task is None:
+                            preparation_task = asyncio.create_task(
+                                self.on_download_song(song)
+                            )
                         preparing_session.preparation_task = preparation_task
                         try:
-                            logger.info(f"[KookMusic] 开始准备队列歌曲: {song.name}")
+                            logger.info(f"[KookMusic] {preparation_label}: {song.name}")
                             updated_song = await preparation_task
                             # 重新检查 session 是否仍然有效
-                            if guild_id not in self.sessions:
+                            if self.sessions.get(guild_id) is not session:
                                 break
                             session = self.sessions[guild_id]
                             if session.pending_skips > 0:
@@ -572,12 +938,15 @@ class VoiceManager:
                             raise
                         except Exception as e:
                             logger.error(f"[KookMusic] 音频准备异常: {song.name}: {e}")
-                            if guild_id in self.sessions:
-                                self._drop_failed_current(self.sessions[guild_id], song)
+                            if self.sessions.get(guild_id) is session:
+                                self._drop_failed_current(session, song)
                             continue
                         finally:
                             if preparing_session.preparation_task is preparation_task:
                                 preparing_session.preparation_task = None
+                            self._cleanup_unused_preparation(
+                                preparing_session, preparation_task
+                            )
                     else:
                         logger.warning(
                             f"[KookMusic] 歌曲无播放源且无准备回调: {song.name}"
@@ -586,9 +955,13 @@ class VoiceManager:
                         continue
 
                 if not is_relay and session.needs_direct_refresh:
+                    if getattr(session.voice_client, "remote_removed", False):
+                        break
                     logger.info("[KookMusic] Direct 模式: 重连语音频道获取新 RTP...")
                     await session.voice_client.disconnect()
                     await asyncio.sleep(self.DIRECT_RECONNECT_DELAY)
+                    if getattr(session.voice_client, "remote_removed", False):
+                        break
                     reconnected = await session.voice_client.connect(
                         session.voice_channel_id
                     )
@@ -617,7 +990,8 @@ class VoiceManager:
                     continue
 
                 logger.info(f"[KookMusic] 开始播放: {song.display_name}")
-                await asyncio.sleep(self.PLAYBACK_START_DELAY)
+                if self.PLAYBACK_START_DELAY > 0:
+                    await asyncio.sleep(self.PLAYBACK_START_DELAY)
                 if session.pending_skips > 0:
                     self._consume_pending_skip(session)
                     continue
@@ -683,28 +1057,19 @@ class VoiceManager:
                         continue
                     logger.error(f"[KookMusic] 播放失败: {song.name}")
                     self._clear_stream_resume_state(song)
-                    if guild_id in self.sessions:
-                        self._drop_failed_current(self.sessions[guild_id], song)
+                    if self.sessions.get(guild_id) is session:
+                        self._drop_failed_current(session, song)
                     continue
                 session.playback_retry_count = 0
                 segment_started_at = time.monotonic()
+                session.playback_started_at = segment_started_at
+                session.playback_offset_seconds = resume_offset
 
-                # 通知外部：新歌曲开始播放（用于发送卡片消息）
-                if (
-                    self.on_song_started
-                    and not song.provider_data.get(self._STREAM_NOTIFIED_KEY)
-                ):
-                    try:
-                        current_session = self.sessions.get(guild_id)
-                        queue_size = len(current_session.playlist) if current_session else 0
-                        loop_name = current_session.loop_mode_name if current_session else "关闭"
-                        result = self.on_song_started(guild_id, song, queue_size, loop_name)
-                        if asyncio.isfuture(result) or asyncio.iscoroutine(result):
-                            await result
-                    except Exception as e:
-                        logger.debug(f"[KookMusic] 歌曲开始回调异常: {e}")
-                    finally:
-                        song.provider_data[self._STREAM_NOTIFIED_KEY] = True
+                self._sync_prefetch(session)
+                self._schedule_song_notification(session, song)
+                # Give background work a turn, not an HTTP round trip. A slow
+                # card upload must never delay observing playback completion.
+                await asyncio.sleep(0)
 
                 # 计算播放超时：歌曲时长(ms->s) + 缓冲时间
                 if song.duration > 0:
@@ -725,7 +1090,16 @@ class VoiceManager:
 
                 # 等待播放完成（带超时保护）
                 playback_completed = await player.wait_until_done(timeout=timeout)
-                segment_elapsed = max(0.0, time.monotonic() - segment_started_at)
+                played_seconds = getattr(player, "played_seconds", None)
+                if (
+                    isinstance(played_seconds, (int, float))
+                    and not isinstance(played_seconds, bool)
+                    and math.isfinite(played_seconds)
+                    and played_seconds >= 0
+                ):
+                    segment_elapsed = float(played_seconds)
+                else:
+                    segment_elapsed = max(0.0, time.monotonic() - segment_started_at)
 
                 # 确保歌曲进程已清理（stop 是幂等的，重复调用无副作用）
                 await player.stop()
@@ -737,7 +1111,7 @@ class VoiceManager:
                     song.extra_headers = {}
 
                 # 重新检查 session 有效性
-                if guild_id not in self.sessions:
+                if self.sessions.get(guild_id) is not session:
                     break
                 session = self.sessions[guild_id]
                 if (
@@ -769,7 +1143,7 @@ class VoiceManager:
                     )
                 self._clear_stream_resume_state(song)
                 # 处理循环模式
-                if guild_id not in self.sessions:
+                if self.sessions.get(guild_id) is not session:
                     break
                 session = self.sessions[guild_id]
                 if session.pending_skips > 0:
@@ -796,6 +1170,8 @@ class VoiceManager:
             logger.error(f"[KookMusic] 播放循环异常: {e}")
             retry_needed = True
         finally:
+            session.is_playing = False
+            self._cancel_prefetch(session)
             # 确保当前歌曲已停止（不停中继进程，由 _cleanup_session 处理）
             try:
                 if player.is_playing:
@@ -810,6 +1186,7 @@ class VoiceManager:
                 retry_needed
                 and current_session is session
                 and current_session.playlist
+                and not getattr(current_session.voice_client, "remote_removed", False)
             ):
                 if current_session.playback_retry_count < self.MAX_PLAYBACK_RETRIES:
                     current_session.playback_retry_count += 1
@@ -825,7 +1202,7 @@ class VoiceManager:
                     current_session.pending_skips = 0
             # 播放队列为空时通知外部（但不自动退出，空闲检查循环会处理退出）
             current_session = self.sessions.get(guild_id)
-            queue_empty = current_session is not None and not current_session.playlist
+            queue_empty = current_session is session and not current_session.playlist
             if queue_empty and isinstance(current_session.ffmpeg_player, RelayFFmpegPlayer):
                 current_session.needs_relay_refresh = True
                 try:
@@ -858,6 +1235,7 @@ class VoiceManager:
                     current is expected_session
                     and current.playlist
                     and not current.is_playing
+                    and not getattr(current.voice_client, "remote_removed", False)
                 ):
                     self._start_playback_loop(guild_id)
             except asyncio.CancelledError:
@@ -870,6 +1248,8 @@ class VoiceManager:
         if session.pending_skips <= 0 or not session.playlist:
             return False
         skipped_song = session.playlist.pop(0)
+        if session.prefetch and session.prefetch.original is skipped_song:
+            self._cancel_prefetch(session)
         session.pending_skips -= 1
         session.idle_seconds = 0
         self._cleanup_song_file(skipped_song)
@@ -907,39 +1287,65 @@ class VoiceManager:
         song.extra_headers = {}
         VoiceManager._clear_stream_resume_state(song)
 
-    async def _cleanup_session(self, guild_id: str):
+    async def _cleanup_session(
+        self, guild_id: str, expected_session: GuildSession | None = None
+    ):
         """清理会话"""
-        retry_task = self._retry_tasks.pop(guild_id, None)
-        if retry_task and not retry_task.done():
-            retry_task.cancel()
-            try:
-                await retry_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        # 先取消播放任务
-        task = self._playback_tasks.pop(guild_id, None)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        session = self.sessions.pop(guild_id, None)
-        if not session:
+        session = self.sessions.get(guild_id)
+        if not session or (
+            expected_session is not None and session is not expected_session
+        ):
             return
+        # 在首个 await 前移除会话，阻止旧播放循环重试或污染新会话。
+        self.sessions.pop(guild_id)
+        self._cancel_prefetch(session)
+        retry_task = self._retry_tasks.pop(guild_id, None)
+        task = self._playback_tasks.pop(guild_id, None)
+        preparation_task = session.preparation_task
+        pending_tasks = list(dict.fromkeys(
+            pending for pending in (
+                retry_task, task, preparation_task,
+                *session.prefetch_tasks, *session.notification_tasks,
+            )
+            if pending is not None and pending is not asyncio.current_task()
+        ))
+        for pending in pending_tasks:
+            if not pending.done():
+                pending.cancel()
+        # Stop audible output before waiting for downloader cancellation or a
+        # shielded card request to return its ID for stale-card cleanup.
+        try:
+            await self._stop_session_resources(session)
+        finally:
+            for pending in pending_tasks:
+                try:
+                    await pending
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if preparation_task is not None:
+                self._cleanup_unused_preparation(session, preparation_task)
+            session.prefetch_tasks.clear()
+            session.notification_tasks.clear()
+        session.preparation_task = None
+        session.is_playing = False
+        session.pending_skips = 0
+        session.playback_retry_count = 0
+        session.playback_started_at = 0.0
+        session.playback_offset_seconds = 0.0
 
-        # 停止播放器
-        player = session.ffmpeg_player
-        if isinstance(player, RelayFFmpegPlayer):
-            # relay 模式：先停歌曲，再停中继进程
-            await player.stop_relay()
-        else:
-            await player.stop()
-
-        await session.voice_client.disconnect()
-
-        # 清理缓存文件
-        for song in session.playlist:
-            self._cleanup_song_file(song)
         logger.info(f"[KookMusic] 会话已清理: {guild_id}")
+
+    async def _stop_session_resources(self, session: GuildSession):
+        player = session.ffmpeg_player
+        try:
+            if isinstance(player, RelayFFmpegPlayer):
+                await player.stop_relay()
+            else:
+                await player.stop()
+        finally:
+            try:
+                await session.voice_client.disconnect()
+            finally:
+                for song in session.playlist:
+                    self._cleanup_song_file(song)
+                session.playlist.clear()
