@@ -46,6 +46,7 @@ class _PendingLogin:
     user_id: str
     generation: int
     deadline: float
+    flow: str = "qr"
     challenge: object = field(default=None, repr=False)
     cleanup: object = field(default=None, repr=False)
     task: object = field(default=None, repr=False)
@@ -89,6 +90,7 @@ class AuthManager:
         self._loop_task = None
         self._closed = False
         self._storage_failed = False
+        self.on_verification_required = None
 
     def _authorized(self, bot_id, user_id):
         return (
@@ -156,6 +158,86 @@ class AuthManager:
             "已启动登录流程，二维码仅发送到本次管理员私聊；请在有效期内扫码确认。",
         )
 
+    async def import_credentials(
+        self, provider, credential, bot_id, user_id, *, authorized=None
+    ):
+        """Validate user-submitted credentials without replacing a healthy account early."""
+        if not self._authorized(bot_id, user_id):
+            return False, "只有账号管理员可以接入音乐账号。"
+        if provider != "netease" or not isinstance(credential, dict) or not credential:
+            return False, "手动接入仅接受网易云登录态。"
+        task = asyncio.current_task()
+        async with self._lock:
+            if self._closed or self._storage_failed or provider not in self.backends:
+                return False, "账号模块当前不可用，原账号未更改。"
+            if provider in self._pending:
+                return False, "该平台已有登录流程，请先完成或取消。"
+            self._generation[provider] += 1
+            pending = _PendingLogin(
+                bot_id,
+                user_id,
+                self._generation[provider],
+                time.monotonic() + self.operation_timeout,
+                flow="manual",
+                task=task,
+            )
+            self._pending[provider] = pending
+            self._login_tasks.add(task)
+        try:
+            validity = await self._backend_check(self.backends[provider], credential)
+            async with self._lock:
+                if (
+                    not self._current(provider, pending)
+                    or time.monotonic() >= pending.deadline
+                ):
+                    return False, "账号操作已取消或状态已变化，原账号未更改。"
+                if authorized is not None and authorized() is not True:
+                    return False, "账号接入权限或机器人绑定已变化，原账号未更改。"
+                if validity != "valid":
+                    return (
+                        False,
+                        "网易云官方校验未通过，请确认已在官网完成登录和验证；原账号未更改。",
+                    )
+                state = copy.deepcopy(self._state)
+                state["accounts"][provider] = {
+                    "credential": copy.deepcopy(credential),
+                    "state": "valid",
+                    "refresh_attempted": False,
+                }
+                self._save(state)
+            return True, "网易云账号已通过官方校验并加密保存。"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False, "账号接入暂时失败，原账号未更改。"
+        finally:
+            async with self._lock:
+                if self._pending.get(provider) is pending:
+                    self._pending.pop(provider, None)
+                self._login_tasks.discard(task)
+
+    async def prepare_manual_handoff(self, bot_id, user_id):
+        if not self._authorized(bot_id, user_id):
+            return False, "只有账号管理员可以创建接入链接。"
+        pending = None
+        async with self._lock:
+            if self._closed or self._storage_failed or "netease" not in self.backends:
+                return False, "账号模块当前不可用。"
+            pending = self._pending.get("netease")
+            if pending is not None and (pending.bot_id, pending.user_id) != (
+                bot_id,
+                user_id,
+            ):
+                return False, "其他管理员正在登录此账号，请先由发起者完成或取消。"
+            self._generation["netease"] += 1
+            if pending is not None:
+                self._pending.pop("netease", None)
+                if pending.task is not asyncio.current_task():
+                    pending.task.cancel()
+        if pending is not None and pending.task is not asyncio.current_task():
+            await asyncio.gather(pending.task, return_exceptions=True)
+        return True, "可以创建手动接入链接。"
+
     async def _login_call(self, pending, awaitable):
         remaining = pending.deadline - time.monotonic()
         if remaining <= 0:
@@ -168,6 +250,7 @@ class AuthManager:
         backend = self.backends[provider]
         label = self._label(provider)
         terminal = None
+        needs_verification = False
         stage = "LOGIN_BEGIN"
         try:
             challenge = await self._login_call(pending, backend.begin_login(method))
@@ -310,6 +393,7 @@ class AuthManager:
                 and isinstance(error, AuthError)
                 and error.kind == "verification_required"
             ):
+                needs_verification = True
                 terminal = (
                     "网易云返回 8821：需要人工完成行为验证码验证，尚未签发登录凭据。"
                     "请在网易云官方页面按提示完成安全验证，不要反复扫码。"
@@ -332,7 +416,30 @@ class AuthManager:
             current = cleanup.result()
             if interrupted:
                 raise asyncio.CancelledError
-            if terminal and current:
+            if (
+                terminal
+                and current
+                and not self._closed
+                and self._generation.get(provider) == pending.generation
+            ):
+                if needs_verification and self.on_verification_required is not None:
+                    try:
+                        link = self.on_verification_required(
+                            pending.bot_id, pending.user_id
+                        )
+                        if inspect.isawaitable(link):
+                            link = await asyncio.wait_for(link, self.operation_timeout)
+                        if isinstance(link, str) and link:
+                            terminal += (
+                                "\n手动账号接入页（不是本次验证码挑战地址）："
+                                + link
+                                + "\n先登录同一 HTTPS 地址的 AstrBot 后台，再打开此一次性链接。"
+                                "在网易云官网完成人工登录/验证后，仅在接入页提交自己的登录态，不要在聊天里发送 Cookie。"
+                            )
+                    except Exception:
+                        terminal += (
+                            "\n手动接入链接暂不可用，请私聊发送 #音乐验证 网易云。"
+                        )
                 await self._send(pending.bot_id, pending.user_id, terminal)
 
     async def _finish_login(self, provider, backend, pending):
@@ -422,7 +529,11 @@ class AuthManager:
                 "unknown": "待验证",
             }.get(record.get("state") if record else None, "未登录")
             if provider in self._pending:
-                label += "，扫码登录进行中"
+                label += (
+                    "，手动接入校验中"
+                    if self._pending[provider].flow == "manual"
+                    else "，扫码登录进行中"
+                )
             lines.append(f"{self._label(provider)}：{label}")
         return "\n".join(lines) or "未启用任何账号登录线路。"
 

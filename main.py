@@ -8,12 +8,14 @@ AstrBot KOOK 语音点歌插件。
 import asyncio
 import copy
 import time
+from contextvars import ContextVar
+from contextlib import aclosing
 from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-from astrbot.core.message.components import Json, Plain
+from astrbot.core.message.components import Json
 
 from . import card_builder
 from .kook_api import (
@@ -47,6 +49,7 @@ _playlist_request_commit_lock = asyncio.Lock()
 
 # 已知的平台标识
 _KNOWN_PLATFORMS = {"netease", "qq", "kugou", "kuwo", "migu", "baidu", "bilibili"}
+_active_music_request = ContextVar("kook_music_request", default=None)
 
 class KookMusicPlugin(MusicAuthMixin, Star):
     """KOOK 语音点歌插件
@@ -272,7 +275,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
         body = event_field(extra, "body")
         if event_type == "message_btn_click":
             value = event_field(body, "value", "")
-            if value not in ("kook_music_next", "kook_music_loop", "kook_music_clear"):
+            if value not in ("kook_music_next", "kook_music_loop", "kook_music_clear", "kook_music_stop"):
                 return
             self._button_click_queue.put_nowait({
                 "value": value,
@@ -360,6 +363,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
             "kook_music_next": "next",
             "kook_music_loop": "loop",
             "kook_music_clear": "clear",
+            "kook_music_stop": "stop",
         }.get(value)
         if not action:
             return
@@ -461,6 +465,46 @@ class KookMusicPlugin(MusicAuthMixin, Star):
 
     # ========== 命令注册 ==========
 
+    async def _run_music_request(self, event, handler):
+        if not self._is_kook(event):
+            return
+        guild_id = self._get_guild_id(event)
+        factory = getattr(getattr(self, "voice_manager", None), "request_activity", None)
+        if not guild_id or not callable(factory):
+            async with aclosing(handler(event)) as results:
+                async for result in results:
+                    yield result
+            return
+        with factory(guild_id) as request:
+            async with aclosing(handler(event)) as results:
+                while True:
+                    marker = _active_music_request.set((guild_id, request))
+                    try:
+                        result = await anext(results)
+                    except StopAsyncIteration:
+                        return
+                    finally:
+                        _active_music_request.reset(marker)
+                    yield result
+
+    @staticmethod
+    def _play_request(guild_id):
+        current = _active_music_request.get()
+        return current[1] if current is not None and current[0] == guild_id else None
+
+    def _play_request_options(self, guild_id):
+        request = self._play_request(guild_id)
+        return {"request": request} if request is not None else {}
+
+    async def _reject_cancelled_request(self, event, guild_id, songs=()):
+        request = self._play_request(guild_id)
+        if request is None or request.current:
+            return False
+        for song in songs:
+            self.voice_manager._cleanup_song_file(song)
+        await event.send(event.plain_result("本次点歌已因停止、退出或移出语音而取消，请重新点歌。"))
+        return True
+
     @filter.command("音乐登录")
     async def on_music_login(self, event: AstrMessageEvent):
         reply = await self._music_auth_command(event, "音乐登录")
@@ -470,6 +514,12 @@ class KookMusicPlugin(MusicAuthMixin, Star):
     @filter.command("音乐账号状态")
     async def on_music_account_status(self, event: AstrMessageEvent):
         reply = await self._music_auth_command(event, "音乐账号状态")
+        if reply is not None:
+            await event.send(event.plain_result(reply))
+
+    @filter.command("音乐验证")
+    async def on_music_verification(self, event: AstrMessageEvent):
+        reply = await self._music_auth_command(event, "音乐验证")
         if reply is not None:
             await event.send(event.plain_result(reply))
 
@@ -487,6 +537,12 @@ class KookMusicPlugin(MusicAuthMixin, Star):
 
     @filter.command("点歌")
     async def on_play_music(self, event: AstrMessageEvent):
+        """点歌 <歌名/单曲链接> [平台]，请求准备期间保持语音会话。"""
+        async with aclosing(self._run_music_request(event, self._on_play_music_request)) as results:
+            async for result in results:
+                yield result
+
+    async def _on_play_music_request(self, event: AstrMessageEvent):
         """点歌 <歌名> [平台] — 在KOOK语音频道播放音乐"""
         if not self._is_kook(event):
             return
@@ -802,8 +858,23 @@ class KookMusicPlugin(MusicAuthMixin, Star):
             await self._delete_card(guild_id)
         yield event.plain_result(f"{'✅' if ok else '❌'} {msg}")
 
+    @filter.command("停止播放")
+    async def on_stop(self, event: AstrMessageEvent):
+        """停止并清空全部歌曲，保留语音连接供后续点歌。"""
+        if not self._is_kook(event):
+            return
+        guild_id = self._get_guild_id(event)
+        ok, msg = await self._control_playback(guild_id, event.get_sender_id(), "stop")
+        yield event.plain_result(f"{'✅' if ok else '❌'} {msg}")
+
     @filter.command("播放")
     async def on_play_video(self, event: AstrMessageEvent):
+        """播放 <关键词/BV号/视频或收藏夹链接>。"""
+        async with aclosing(self._run_music_request(event, self._on_play_video_request)) as results:
+            async for result in results:
+                yield result
+
+    async def _on_play_video_request(self, event: AstrMessageEvent):
         """播放 <关键词/BV号/视频或收藏夹链接> — 播放视频音频"""
         if not self._is_kook(event):
             return
@@ -890,6 +961,12 @@ class KookMusicPlugin(MusicAuthMixin, Star):
 
     @filter.command("导入歌单")
     async def on_import_playlist(self, event: AstrMessageEvent):
+        """导入歌单链接，超出容量时等待选择歌曲区间。"""
+        async with aclosing(self._run_music_request(event, self._on_import_playlist_request)) as results:
+            async for result in results:
+                yield result
+
+    async def _on_import_playlist_request(self, event: AstrMessageEvent):
         """导入歌单 <歌单ID或链接> — 导入多平台歌单到播放队列"""
         if not self._is_kook(event):
             return
@@ -1075,6 +1152,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
                     voice_channel_id or "",
                     channel_id,
                     songs,
+                    **self._play_request_options(guild_id),
                 )
         if request_replaced:
             yield event.plain_result("ℹ️ 本次导入已由更新的批量请求替换")
@@ -1323,6 +1401,8 @@ class KookMusicPlugin(MusicAuthMixin, Star):
         如果当前没有歌曲在播放，立即下载并播放。
         如果已有歌曲在播放，仅加入队列；由后台预准备或队首准备负责下载。
         """
+        if await self._reject_cancelled_request(event, guild_id, (song,)):
+            return
         # 填充请求者信息
         song.requester_id = event.get_sender_id()
         song.requester_name = event.get_sender_name()
@@ -1390,6 +1470,8 @@ class KookMusicPlugin(MusicAuthMixin, Star):
                 self.voice_manager._cleanup_song_file(song)
                 return
 
+        if await self._reject_cancelled_request(event, guild_id, (song,)):
+            return
         text_channel_id = self._get_channel_id(event)
 
         # 加入频道并播放/入队
@@ -1399,6 +1481,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
             voice_channel_id,
             text_channel_id,
             song,
+            **self._play_request_options(guild_id),
         )
 
         if ok:
@@ -1620,6 +1703,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
                         voice_channel_id or "",
                         channel_id,
                         songs,
+                        **self._play_request_options(guild_id),
                     )
             if request_replaced:
                 await event.send(event.plain_result(

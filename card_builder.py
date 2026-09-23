@@ -164,6 +164,13 @@ def build_now_playing_card(
                 "value": "kook_music_clear",
                 "click": "return-val"
             },
+            {
+                "type": "button",
+                "theme": "danger",
+                "text": {"type": "plain-text", "content": "⏹ 停止"},
+                "value": "kook_music_stop",
+                "click": "return-val"
+            },
         ]
     })
 
@@ -355,7 +362,7 @@ def build_import_result_card(
 
     modules.append({
         "type": "header",
-        "text": {"type": "plain-text", "content": f"📥 歌单导入完成"}
+        "text": {"type": "plain-text", "content": "📥 歌单导入完成"}
     })
 
     info_parts = [
@@ -560,6 +567,13 @@ def build_bilibili_playing_card(
                 "theme": "danger",
                 "text": {"type": "plain-text", "content": "🗑 清空"},
                 "value": "kook_music_clear",
+                "click": "return-val"
+            },
+            {
+                "type": "button",
+                "theme": "danger",
+                "text": {"type": "plain-text", "content": "⏹ 停止"},
+                "value": "kook_music_stop",
                 "click": "return-val"
             },
         ]
