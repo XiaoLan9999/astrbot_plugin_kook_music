@@ -141,11 +141,12 @@ async def smoke():
             "real schema notice dedup period",
         )
         check(defaults["music_auth_login_timeout"] == 180, "real schema QR deadline")
+        check(defaults["music_auth_cookie_timeout"] == 180, "real schema private import deadline")
         check(
             not any(
                 "cookie" in key.lower()
                 for key in defaults
-                if key.startswith("music_auth")
+                if key.startswith("music_auth") and key != "music_auth_cookie_timeout"
             ),
             "no raw cookie config field",
         )

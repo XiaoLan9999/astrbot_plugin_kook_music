@@ -61,18 +61,12 @@
         "type": "string",
         "default": ""
     },
-    "music_auth_web_base_url": {
-        "description": "手动账号接入页的安全后台地址",
-        "hint": "填写 HTTPS AstrBot 后台根地址；或仅经 SSH 隧道访问的 http://127.0.0.1:端口。拒绝公网 HTTP。页面仍要求登录 AstrBot 后台，并使用管理员私聊领取的一次性票据。留空关闭手动接入页。",
-        "type": "string",
-        "default": ""
-    },
-    "music_auth_web_ttl": {
-        "description": "手动接入链接有效期（秒）",
-        "hint": "60-600秒，单次使用。新链接、取消、注销、账号更新或插件重载会撤销旧链接。",
+    "music_auth_cookie_timeout": {
+        "description": "私聊 Cookie 导入等待时间（秒）",
+        "hint": "管理员发送音乐Cookie 网易云后，等待一条完整Cookie消息的时间。新导入、取消、注销或插件重载使旧等待失效。支持JSON、Header String、Netscape。",
         "type": "int",
-        "slider": {"min": 60, "max": 600, "step": 30},
-        "default": 600
+        "slider": {"min": 30, "max": 600, "step": 30},
+        "default": 180
     },
     "music_auth_check_interval": {
         "description": "音乐账号登录状态检查间隔（秒）",

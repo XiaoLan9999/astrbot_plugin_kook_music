@@ -44,8 +44,12 @@ class MusicAuthMixin:
         self._music_auth_lock = asyncio.Lock()
         self._music_auth_closed = False
         self._music_auth_failed = False
-        self._music_auth_portal = None
-        self._music_auth_portal_failed = False
+        from .private_cookie import PrivateCookieIntake
+
+        self._music_cookie_intake = PrivateCookieIntake(self)
+
+    def _intercept_music_auth(self, client, event, token):
+        return self._music_cookie_intake.intercept(client, event, token)
 
     def _manual_auth_allowed(self, bot_id, user_id):
         if (
@@ -67,60 +71,31 @@ class MusicAuthMixin:
             }
         ):
             return False
-        if self._music_auth_portal is not None:
-            try:
-                from .verification_portal import _base_url
-
-                current_base, _ = _base_url(
-                    self.config.get("music_auth_web_base_url", "")
-                )
-                if current_base != self._music_auth_portal.base_url:
-                    return False
-            except ValueError:
-                return False
         platform = self._account_platform()
         if platform is None or self._account_platform_id(platform) != bot_id:
             return False
         token = str(platform.config.get("kook_bot_token", "") or "").strip()
         return self._music_auth_binding == (bot_id, token)
 
-    def _ensure_verification_portal(self):
-        if self._music_auth_portal is not None or self._music_auth_portal_failed:
-            return
-        base = str(self.config.get("music_auth_web_base_url", "") or "").strip()
-        if not base:
-            return
-        try:
-            from .verification_portal import VerificationPortal
-
-            portal = VerificationPortal(
-                base,
-                self._import_netease_cookie,
-                self._manual_auth_allowed,
-                ttl=_number(self.config.get("music_auth_web_ttl"), 600, 60, 600),
-            )
-            portal.register(self.context)
-            self._music_auth_portal = portal
-        except Exception as exc:
-            self._music_auth_portal_failed = True
-            logger.warning("[KookMusic] 手动账号接入页未注册 (%s)", type(exc).__name__)
-
     def _verification_link(self, bot_id, user_id):
-        self._ensure_verification_portal()
-        if self._music_auth_portal is None:
-            raise RuntimeError("Secure account portal is not configured")
-        self._music_auth_portal.revoke(bot_id)
-        return self._music_auth_portal.issue_link(bot_id, user_id)
+        from .private_cookie import GUIDE
 
-    async def _import_netease_cookie(self, bot_id, user_id, text):
+        if not self._manual_auth_allowed(bot_id, user_id):
+            raise RuntimeError("Account access changed")
+        return GUIDE
+
+    async def _import_netease_cookie(self, bot_id, user_id, text, *, authorized=None):
         if not self._manual_auth_allowed(bot_id, user_id):
             return False, "账号接入权限已变化。"
-        from .manual_cookie import parse_netease_cookie
+        from .manual_cookie import CookieInputError, parse_netease_cookie
 
         try:
             credential = parse_netease_cookie(text)
+        except CookieInputError as exc:
+            logger.info("[KookMusic] Manual cookie rejected (%s)", exc.code)
+            return False, f"{exc} 阶段：{exc.code}。原账号未更改，请重新开启接收窗口。"
         except ValueError:
-            return False, "网易云登录态格式无效，原账号未更改。"
+            return False, "网易云登录态格式无效（COOKIE_FORMAT），原账号未更改。请完整复制 Header String / JSON / Netscape，再重新开启窗口。"
         manager = self._music_auth
         result = await manager.import_credentials(
             "netease",
@@ -130,19 +105,9 @@ class MusicAuthMixin:
             authorized=lambda: (
                 self._music_auth is manager
                 and self._manual_auth_allowed(bot_id, user_id)
+                and (authorized is None or authorized())
             ),
         )
-        if result[0] and self._manual_auth_allowed(bot_id, user_id):
-            if self._music_auth_portal is not None:
-                self._music_auth_portal.revoke(bot_id)
-            try:
-                await self._notify_music_auth(
-                    bot_id,
-                    user_id,
-                    "网易云手动登录态已通过官方校验并加密保存，可使用账号备用取歌线路。",
-                )
-            except Exception:
-                pass
         return result
 
     def _account_platform(self):
@@ -173,6 +138,7 @@ class MusicAuthMixin:
         return await send_private_auth(token, str(user_id), str(text), qr_bytes)
 
     async def _ensure_music_auth(self):
+        self._music_cookie_intake.refresh()
         if (
             not getattr(self, "_music_auth_enabled", False)
             or self._music_auth_closed
@@ -191,7 +157,6 @@ class MusicAuthMixin:
                 str(platform.config.get("kook_bot_token", "") or "").strip(),
             )
             if self._music_auth is not None and self._music_auth_binding == binding:
-                self._ensure_verification_portal()
                 return self._music_auth
             await self._stop_music_auth_instance()
             try:
@@ -226,7 +191,6 @@ class MusicAuthMixin:
                 return None
             self._music_auth = manager
             self._music_auth_binding = binding
-            self._ensure_verification_portal()
             manager.on_verification_required = self._verification_link
 
             async def start():
@@ -243,10 +207,8 @@ class MusicAuthMixin:
             return manager
 
     async def _stop_music_auth_instance(self):
-        if getattr(self, "_music_auth_portal", None) is not None:
-            await self._music_auth_portal.close()
-            self._music_auth_portal = None
-        self._music_auth_portal_failed = False
+        if self._music_auth_binding is not None:
+            self._music_cookie_intake.revoke(include_busy=True)
         if self._music_auth_start_task is not None:
             self._music_auth_start_task.cancel()
             await asyncio.gather(self._music_auth_start_task, return_exceptions=True)
@@ -258,6 +220,7 @@ class MusicAuthMixin:
 
     async def _close_music_auth(self):
         self._music_auth_closed = True
+        await self._music_cookie_intake.close()
         async with self._music_auth_lock:
             await self._stop_music_auth_instance()
 
@@ -267,7 +230,7 @@ class MusicAuthMixin:
             return AudioResult("unavailable")
         return await manager.resolve_audio(song)
 
-    async def _music_auth_command(self, event, command):
+    async def _music_auth_command(self, event, command, *, intake=False):
         if event.get_platform_name() != "kook":
             return None
         event.stop_event()
@@ -298,28 +261,8 @@ class MusicAuthMixin:
             .strip()
             .lower()
         )
-        if command == "音乐验证":
-            if argument not in {"网易云", "netease"}:
-                return "用法：#音乐验证 网易云。仅在官方页面手动验证后接入自己的网易云登录态。"
-            self._ensure_verification_portal()
-            if self._music_auth_portal is None:
-                return "尚未配置安全接入页；请设置 music_auth_web_base_url 为 HTTPS 后台地址或 HTTP 回环 SSH 隧道地址。"
-            ok, detail = await manager.prepare_manual_handoff(bot_id, actor)
-            if not ok:
-                return detail
-            try:
-                link = self._verification_link(bot_id, actor)
-                await self._notify_music_auth(
-                    bot_id,
-                    actor,
-                    "网易云手动账号接入页（不是本次验证码挑战地址）："
-                    + link
-                    + "\n请先登录同域名 HTTPS AstrBot 后台，再打开此链接；十分钟内单次有效，请勿转发。"
-                    "在网易云官网完成手动登录/验证后，仅在接入页提交自己的 Cookie，不要发到聊天。",
-                )
-                return "已在本私聊发送一次性手动账号接入链接。"
-            except Exception:
-                return "手动接入链接生成或私聊发送失败，请稍后重试。"
+        if command in {"音乐验证", "音乐Cookie"}:
+            return "私聊早期拦截尚未就绪，请稍后重新发送 #音乐Cookie 网易云；此路径不接收 Cookie。"
         options = {
             "qq": ("qq", "qq"),
             "微信": ("qq", "wechat"),
@@ -331,18 +274,14 @@ class MusicAuthMixin:
         }
         target = options.get(argument)
         if target is None:
-            return "私聊命令：音乐登录 qq / 音乐登录 微信 / 音乐登录 网易云 / 音乐登录 网易云网页；音乐账号状态；取消音乐登录 qq|网易云；退出音乐账号 qq|网易云。无需发送密码或 Cookie。"
+            return "私聊命令：音乐登录 qq / 音乐登录 微信 / 音乐登录 网易云 / 音乐登录 网易云网页；音乐Cookie 网易云；音乐账号状态；取消音乐登录 qq|网易云；退出音乐账号 qq|网易云。请勿发送密码。"
         provider, method = target
+        if provider == "netease" and not intake:
+            self._music_cookie_intake.revoke()
         if command == "音乐登录":
             ok, detail = await manager.start_login(provider, method, bot_id, actor)
         elif command == "取消音乐登录":
             ok, detail = await manager.cancel_login(provider, bot_id, actor)
         else:
             ok, detail = await manager.logout(provider, bot_id, actor)
-        if provider == "netease" and self._music_auth_portal is not None:
-            if ok:
-                self._music_auth_portal.revoke(bot_id)
-            elif command == "取消音乐登录":
-                self._music_auth_portal.revoke(bot_id, actor)
-                detail += " 本人尚未提交的手动接入链接已撤销。"
         return detail

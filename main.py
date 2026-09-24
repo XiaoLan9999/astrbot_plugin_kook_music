@@ -138,7 +138,9 @@ class KookMusicPlugin(MusicAuthMixin, Star):
         self._adapter_sync_task: asyncio.Task | None = None
         self._voice_exit_tasks: set[asyncio.Task] = set()
         self._button_click_queue = asyncio.Queue()
-        self._adapter_bridge = KookEventBridge(self._handle_kook_system_event)
+        self._adapter_bridge = KookEventBridge(
+            self._handle_kook_system_event, self._intercept_music_auth
+        )
         self._token_mismatch_warned = False
 
     async def initialize(self):
@@ -520,6 +522,12 @@ class KookMusicPlugin(MusicAuthMixin, Star):
     @filter.command("音乐验证")
     async def on_music_verification(self, event: AstrMessageEvent):
         reply = await self._music_auth_command(event, "音乐验证")
+        if reply is not None:
+            await event.send(event.plain_result(reply))
+
+    @filter.command("音乐Cookie")
+    async def on_music_cookie(self, event: AstrMessageEvent):
+        reply = await self._music_auth_command(event, "音乐Cookie")
         if reply is not None:
             await event.send(event.plain_result(reply))
 

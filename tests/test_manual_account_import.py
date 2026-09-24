@@ -175,21 +175,62 @@ class ManualImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager._state["accounts"]["netease"]["credential"], OLD)
 
     async def test_8821_handoff_only_after_qr_cleanup_and_private_notify(self):
-        link = "https://bot.example/api/plug/netease#ticket=synthetic"
+        guidance = "请私聊发送 #音乐Cookie 网易云 开始导入。"
 
         def handoff(bot, user):
             self.assertNotIn("netease", self.manager._pending)
             self.backend.cancel_login.assert_awaited_once()
             self.assertEqual((bot, user), ("bot", "owner"))
-            return link
+            return guidance
 
         self.manager.on_verification_required = handoff
         await self.manager.start_login("netease", "netease", "bot", "owner")
         await asyncio.wait_for(asyncio.shield(self.manager._pending["netease"].task), 1)
         terminal = self.notify.await_args.args[2]
-        self.assertIn(link, terminal)
-        self.assertIn("不是本次验证码", terminal)
+        self.assertIn(guidance, terminal)
+        self.assertNotIn("接入页", terminal)
         self.assertNotIn("secret", terminal)
+
+    async def test_manual_diagnostics_distinguish_expired_unknown_without_values(self):
+        for validity, stage in (
+            ("expired", "CHECK_EXPIRED"),
+            ("unknown", "CHECK_UNKNOWN"),
+        ):
+            self.backend.check_credentials.return_value = validity
+            with self.assertLogs("astrbot", level="WARNING") as logs:
+                result = await self.manager.import_credentials(
+                    "netease", NEW, "bot", "owner"
+                )
+            self.assertFalse(result[0])
+            self.assertIn(stage, result[1])
+            self.assertIn(stage, " ".join(logs.output))
+            self.assertNotIn("synthetic-new", " ".join(logs.output) + result[1])
+
+    async def test_manual_unexpected_check_error_is_redacted(self):
+        self.backend.check_credentials.side_effect = RuntimeError(
+            "synthetic-secret-from-upstream"
+        )
+        with self.assertLogs("astrbot", level="WARNING") as logs:
+            result = await self.manager.import_credentials(
+                "netease", NEW, "bot", "owner"
+            )
+        self.assertFalse(result[0])
+        self.assertIn("CHECK_ERROR", " ".join(logs.output))
+        self.assertNotIn("synthetic-secret", " ".join(logs.output) + result[1])
+
+    async def test_manual_save_failure_keeps_old_account_and_redacts_error(self):
+        from unittest.mock import patch
+
+        with patch.object(
+            self.manager, "_save", side_effect=OSError("synthetic-secret-path")
+        ):
+            with self.assertLogs("astrbot", level="WARNING") as logs:
+                result = await self.manager.import_credentials(
+                    "netease", NEW, "bot", "owner"
+                )
+        self.assertIn("SAVE_FAILED", result[1])
+        self.assertEqual(self.manager._state["accounts"]["netease"]["credential"], OLD)
+        self.assertNotIn("synthetic-secret", " ".join(logs.output) + result[1])
 
 
 if __name__ == "__main__":

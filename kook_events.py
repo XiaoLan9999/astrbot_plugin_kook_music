@@ -1,10 +1,11 @@
 """Lifecycle-safe interception of AstrBot's KOOK gateway callback."""
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from astrbot.api import logger
+logger = logging.getLogger("astrbot")
 
 
 def event_field(value, name: str, default=None):
@@ -27,8 +28,9 @@ class _Binding:
 
 
 class KookEventBridge:
-    def __init__(self, on_event):
+    def __init__(self, on_event, intercept=None):
         self.on_event = on_event
+        self.intercept = intercept
         self._bindings: dict[int, _Binding] = {}
 
     def sync(self, platforms):
@@ -56,6 +58,14 @@ class KookEventBridge:
 
             async def callback(event, _binding=binding):
                 if _binding.active:
+                    if self.intercept is not None:
+                        try:
+                            if self.intercept(_binding.client, event, _binding.token):
+                                return
+                        except Exception:
+                            # Interceptor failures must not expose account messages.
+                            logger.error("[KookMusic] Private account interceptor failed")
+                            return
                     try:
                         await self.on_event(_binding.client, event, _binding.token)
                     except Exception as exc:

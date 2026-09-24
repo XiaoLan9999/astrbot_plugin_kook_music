@@ -299,6 +299,23 @@ class CredentialAudioTests(unittest.IsolatedAsyncioTestCase):
             "valid",
         )
 
+    async def test_failed_check_logs_only_code_and_boolean_shape(self):
+        payload = {
+            "code": 8821,
+            "account": {"id": "private-account-not-an-id"},
+            "profile": {"nickname": "private-nickname"},
+            "message": "private-server-response",
+        }
+        with self.assertLogs(
+            "astrbot_plugin_kook_music.music_auth.netease_backend", level="WARNING"
+        ) as logs:
+            self.assertEqual(await self.call("check_credentials", payload), "unknown")
+        output = " ".join(logs.output)
+        self.assertIn("NETEASE_CHECK:HTTP200:CODE8821", output)
+        self.assertIn("ACCOUNT_VALID0 PROFILE_PRESENT1", output)
+        self.assertNotIn("private-", output)
+        self.assertNotIn(COOKIE["MUSIC_U"], output)
+
     async def test_missing_account_expired(self):
         self.assertEqual(
             await self.call(

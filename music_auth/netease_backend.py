@@ -59,6 +59,7 @@ _LOGIN_STAGES = frozenset(
         "NETEASE_COOKIE",
         "NETEASE_REQUEST",
         "NETEASE_VERIFY",
+        "NETEASE_CHECK",
     }
 )
 
@@ -444,14 +445,22 @@ class NeteaseBackend:
             body, _ = await self._request("/weapi/w/nuser/account/get", {}, cookies)
         except AuthError:
             return "unknown"
+        account = body.get("account")
+        valid_account = isinstance(account, dict) and bool(
+            re.fullmatch(r"[1-9][0-9]*", str(account.get("id", "")))
+        )
+        if body.get("code") != 200 or not valid_account:
+            _LOGGER.warning(
+                "NetEase credential check failed: %s ACCOUNT_VALID%d PROFILE_PRESENT%d",
+                _diagnostic("NETEASE_CHECK", http=200, code=body.get("code")),
+                int(valid_account),
+                int(isinstance(body.get("profile"), dict)),
+            )
         if body.get("code") == 301:
             return "expired"
         if body.get("code") != 200:
             return "unknown"
-        account = body.get("account")
-        if isinstance(account, dict) and re.fullmatch(
-            r"[1-9][0-9]*", str(account.get("id", ""))
-        ):
+        if valid_account:
             return "valid"
         if "account" in body and account is None and body.get("profile") is None:
             return "expired"

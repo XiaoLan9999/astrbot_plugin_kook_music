@@ -183,8 +183,11 @@ class AuthManager:
             )
             self._pending[provider] = pending
             self._login_tasks.add(task)
+        stage = "CHECK_FAILED"
         try:
-            validity = await self._backend_check(self.backends[provider], credential)
+            validity = await self._backend_check(
+                self.backends[provider], credential, log_manual=True
+            )
             async with self._lock:
                 if (
                     not self._current(provider, pending)
@@ -194,9 +197,18 @@ class AuthManager:
                 if authorized is not None and authorized() is not True:
                     return False, "账号接入权限或机器人绑定已变化，原账号未更改。"
                 if validity != "valid":
+                    stage = (
+                        "CHECK_EXPIRED" if validity == "expired" else "CHECK_UNKNOWN"
+                    )
+                    logger.warning("[KookMusicAuth] manual import failed: %s", stage)
                     return (
                         False,
-                        "网易云官方校验未通过，请确认已在官网完成登录和验证；原账号未更改。",
+                        (
+                            "网易云官方未识别有效登录，请重新从已登录的官网导出 Cookie。"
+                            if validity == "expired"
+                            else "网易云官方暂未能确认登录有效，请稍后重试。"
+                        )
+                        + f" 原账号未更改。阶段：{stage}。",
                     )
                 state = copy.deepcopy(self._state)
                 state["accounts"][provider] = {
@@ -204,12 +216,15 @@ class AuthManager:
                     "state": "valid",
                     "refresh_attempted": False,
                 }
+                stage = "SAVE_FAILED"
                 self._save(state)
+            logger.info("[KookMusicAuth] manual import completed: IMPORT_OK")
             return True, "网易云账号已通过官方校验并加密保存。"
         except asyncio.CancelledError:
             raise
         except Exception:
-            return False, "账号接入暂时失败，原账号未更改。"
+            logger.warning("[KookMusicAuth] manual import failed: %s", stage)
+            return False, f"账号接入暂时失败，原账号未更改。阶段：{stage}。"
         finally:
             async with self._lock:
                 if self._pending.get(provider) is pending:
@@ -218,7 +233,7 @@ class AuthManager:
 
     async def prepare_manual_handoff(self, bot_id, user_id):
         if not self._authorized(bot_id, user_id):
-            return False, "只有账号管理员可以创建接入链接。"
+            return False, "只有账号管理员可以开始 Cookie 导入。"
         pending = None
         async with self._lock:
             if self._closed or self._storage_failed or "netease" not in self.backends:
@@ -236,7 +251,7 @@ class AuthManager:
                     pending.task.cancel()
         if pending is not None and pending.task is not asyncio.current_task():
             await asyncio.gather(pending.task, return_exceptions=True)
-        return True, "可以创建手动接入链接。"
+        return True, "可以开始私聊 Cookie 导入。"
 
     async def _login_call(self, pending, awaitable):
         remaining = pending.deadline - time.monotonic()
@@ -424,22 +439,17 @@ class AuthManager:
             ):
                 if needs_verification and self.on_verification_required is not None:
                     try:
-                        link = self.on_verification_required(
+                        guidance = self.on_verification_required(
                             pending.bot_id, pending.user_id
                         )
-                        if inspect.isawaitable(link):
-                            link = await asyncio.wait_for(link, self.operation_timeout)
-                        if isinstance(link, str) and link:
-                            terminal += (
-                                "\n手动账号接入页（不是本次验证码挑战地址）："
-                                + link
-                                + "\n先登录同一 HTTPS 地址的 AstrBot 后台，再打开此一次性链接。"
-                                "在网易云官网完成人工登录/验证后，仅在接入页提交自己的登录态，不要在聊天里发送 Cookie。"
+                        if inspect.isawaitable(guidance):
+                            guidance = await asyncio.wait_for(
+                                guidance, self.operation_timeout
                             )
+                        if isinstance(guidance, str) and guidance:
+                            terminal += "\n" + guidance
                     except Exception:
-                        terminal += (
-                            "\n手动接入链接暂不可用，请私聊发送 #音乐验证 网易云。"
-                        )
+                        terminal += "\n请在官网完成登录后，私聊发送 #音乐Cookie 网易云 开始导入。"
                 await self._send(pending.bot_id, pending.user_id, terminal)
 
     async def _finish_login(self, provider, backend, pending):
@@ -567,14 +577,20 @@ class AuthManager:
             except Exception:
                 continue
 
-    async def _backend_check(self, backend, credential):
+    async def _backend_check(self, backend, credential, *, log_manual=False):
         try:
             value = await asyncio.wait_for(
                 backend.check_credentials(copy.deepcopy(credential)),
                 self.operation_timeout,
             )
             return value if value in {"valid", "expired", "unknown"} else "unknown"
+        except TimeoutError:
+            if log_manual:
+                logger.warning("[KookMusicAuth] manual credential check: CHECK_TIMEOUT")
+            return "unknown"
         except Exception:
+            if log_manual:
+                logger.warning("[KookMusicAuth] manual credential check: CHECK_ERROR")
             return "unknown"
 
     async def _check_provider(
