@@ -40,7 +40,7 @@ class LargePlaylistTests(unittest.TestCase):
 
         self.assertLessEqual(len(card["modules"]), 50)
         rendered = str(card)
-        self.assertIn("仅展示前 100 首", rendered)
+        self.assertIn("第 1/20 页，显示 1-100", rendered)
         self.assertIn("共 **2000** 首", rendered)
 
     def test_user_example_url_keeps_playlist_id_and_ignores_extra_query(self):

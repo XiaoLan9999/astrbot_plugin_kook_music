@@ -23,7 +23,9 @@ from .kook_api import (
     send_text_message,
     delete_message,
     close_shared_session,
+    observe_card_receipt,
 )
+from .card_cleanup import CardCleanupMixin
 from .kook_voice.voice_manager import VoiceManager
 from .kook_voice.ffmpeg_installer import check_and_install_ffmpeg
 from .music.downloader import MusicDownloader
@@ -51,7 +53,7 @@ _playlist_request_commit_lock = asyncio.Lock()
 _KNOWN_PLATFORMS = {"netease", "qq", "kugou", "kuwo", "migu", "baidu", "bilibili"}
 _active_music_request = ContextVar("kook_music_request", default=None)
 
-class KookMusicPlugin(MusicAuthMixin, Star):
+class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
     """KOOK 语音点歌插件
 
     在 KOOK 平台实现语音频道点歌：
@@ -132,6 +134,8 @@ class KookMusicPlugin(MusicAuthMixin, Star):
         # 已发送的卡片消息 ID 映射：guild_id -> msg_id（用于播放结束后清理）
         self._card_msg_ids: dict[str, list[str]] = {}
         self._card_locks: dict[str, asyncio.Lock] = {}
+        self._card_ledger = None
+        self._card_cleanup_task = None
 
         # 后台任务引用（用于 terminate 时取消）
         self._button_handler_task: asyncio.Task | None = None
@@ -139,7 +143,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
         self._voice_exit_tasks: set[asyncio.Task] = set()
         self._button_click_queue = asyncio.Queue()
         self._adapter_bridge = KookEventBridge(
-            self._handle_kook_system_event, self._intercept_music_auth
+            self._handle_kook_system_event, self._intercept_gateway_event
         )
         self._token_mismatch_warned = False
 
@@ -183,6 +187,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
 
         # 注入 KOOK 按钮点击事件处理
         self._patch_kook_adapter()
+        self._init_card_cleanup()
 
         # 注册播放管理器回调（只注册一次，避免多服务器场景下被覆盖）
         self.voice_manager.on_playback_finished = lambda gid: asyncio.create_task(
@@ -200,6 +205,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
     async def terminate(self):
         """插件卸载清理"""
         logger.info("[KookMusic] 正在清理资源...")
+        await self._close_card_cleanup()
         if hasattr(self, "_music_auth_lock"):
             await self._close_music_auth()
         if self._adapter_sync_task:
@@ -267,7 +273,12 @@ class KookMusicPlugin(MusicAuthMixin, Star):
     def _restore_kook_adapter(self):
         self._adapter_bridge.close()
 
+    def _intercept_gateway_event(self, client, event, token):
+        observe_card_receipt(token, str(getattr(client, "bot_id", "") or ""), event)
+        return self._intercept_music_auth(client, event, token)
+
     async def _handle_kook_system_event(self, client, event, token: str):
+        observe_card_receipt(token, str(getattr(client, "bot_id", "") or ""), event)
         if event_field(event, "type") is None and event_field(event, "s") == 0:
             event = event_field(event, "d")
         if enum_value(event_field(event, "type")) != 255:
@@ -275,6 +286,16 @@ class KookMusicPlugin(MusicAuthMixin, Star):
         extra = event_field(event, "extra")
         event_type = enum_value(event_field(extra, "type"))
         body = event_field(extra, "body")
+        if event_type == "deleted_message":
+            deleted_id = str(event_field(body, "msg_id", "") or "")
+            ledger = getattr(self, "_card_ledger", None)
+            if ledger is not None:
+                record = ledger.records.get(deleted_id)
+                if record and record["token_hash"] == ledger.token_hash(token):
+                    self._ledger_write("forget", [deleted_id])
+                    guild = record["guild_id"]
+                    self._card_msg_ids[guild] = [mid for mid in self._card_msg_ids.get(guild, []) if mid != deleted_id]
+            return
         if event_type == "message_btn_click":
             value = event_field(body, "value", "")
             if value not in ("kook_music_next", "kook_music_loop", "kook_music_clear", "kook_music_stop"):
@@ -380,6 +401,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
     async def _control_playback(
         self, guild_id: str, user_id: str, action: str,
         *, expected_session=None, position: int | None = None,
+        destination: int | None = None,
     ) -> tuple[bool, str]:
         user_id = str(user_id or "").strip()
         if not user_id:
@@ -389,19 +411,27 @@ class KookMusicPlugin(MusicAuthMixin, Star):
             return False, "当前没有可控制的语音会话"
         if expected_session is not None and session is not expected_session:
             return False, "播放会话已变化，请使用最新卡片重试"
-        song = VoiceManager.control_song(session)
+        edit = action in {"move", "remove", "reorder"}
+        if edit and (type(position) is not int or not 2 <= position <= len(session.playlist)):
+            return False, "请使用当前歌单中的待播序号（第 1 首不可编辑）"
+        song = session.playlist[position - 1] if edit else VoiceManager.control_song(session)
         requester_id = str(song.requester_id or "") if song is not None else ""
         admin = False
         if user_id != requester_id:
             admin = await is_guild_admin(session.voice_client.token, guild_id, user_id)
             if not admin:
-                return False, "仅当前歌曲的点歌者或 KOOK 服务器管理员可操作"
+                return False, "只能编辑自己点的待播歌曲，管理员可编辑全部" if edit else "仅当前歌曲的点歌者或 KOOK 服务器管理员可操作"
         # The manager rechecks ownership after taking its lock: an API lookup or
         # an earlier skip may have moved playback to a different user's song.
-        return await self.voice_manager.control(
+        old_cards = list(self._card_msg_ids.get(guild_id, []))
+        options = {"destination": destination} if destination is not None else {}
+        result = await self.voice_manager.control(
             guild_id, action, actor_id=user_id, is_admin=admin,
-            expected_session=session, position=position,
+            expected_session=session, position=position, **options,
         )
+        if result[0] and action in {"next", "stop", "leave"}:
+            self._retire_card_ids(old_cards)
+        return result
 
     def _find_kook_token(self) -> str:
         """获取 KOOK Token（优先插件配置，其次从平台适配器实例获取）"""
@@ -801,10 +831,74 @@ class KookMusicPlugin(MusicAuthMixin, Star):
         if not session:
             yield event.plain_result("📋 当前没有播放队列")
             return
+        parts = str(getattr(event, "message_str", "")).split()
+        if parts and parts[0].lstrip("#/") == "歌单":
+            parts = parts[1:]
+        pages = max(1, (len(session.playlist) + 99) // 100)
+        if len(parts) > 1 or parts and (not parts[0].isascii() or not parts[0].isdigit() or len(parts[0]) > 4):
+            yield event.plain_result("用法：歌单 [页码]，例如：歌单 2")
+            return
+        page = int(parts[0]) if parts else 1
+        if not 1 <= page <= pages:
+            yield event.plain_result(f"请输入 1-{pages} 之间的页码")
+            return
         card_data = card_builder.build_queue_card(
-            session.playlist, session.loop_mode_name
+            session.playlist, session.loop_mode_name, page=page
         )
         yield event.chain_result([Json(data=card_data)])
+
+    async def _edit_queue_command(self, event, command, action, count):
+        if not self._is_kook(event):
+            return
+        guild_id = self._get_guild_id(event)
+        if not guild_id:
+            yield event.plain_result("❌ 请在 KOOK 服务器文字频道操作")
+            return
+        parts = event.message_str.strip().split()
+        if parts and parts[0].lstrip("#/") == command:
+            parts = parts[1:]
+        if len(parts) != count or any(not part.isascii() or not part.isdigit() or len(part) > 5 for part in parts):
+            usage = "来源序号 目标序号" if count == 2 else "歌曲序号"
+            yield event.plain_result(f"用法：{command} {usage}；先用 歌单 查看当前序号。第 1 首不可编辑。")
+            return
+        options = {"destination": int(parts[1])} if count == 2 else {}
+        ok, message = await self._control_playback(
+            guild_id, event.get_sender_id(), action, position=int(parts[0]), **options,
+        )
+        yield event.plain_result(f"{'✅' if ok else '❌'} {message}")
+
+    @filter.command("队列删除")
+    async def on_queue_remove(self, event: AstrMessageEvent):
+        async for result in self._edit_queue_command(event, "队列删除", "remove", 1):
+            yield result
+
+    @filter.command("队列移动")
+    async def on_queue_reorder(self, event: AstrMessageEvent):
+        async for result in self._edit_queue_command(event, "队列移动", "reorder", 2):
+            yield result
+
+    @filter.command("队列置顶")
+    async def on_queue_top(self, event: AstrMessageEvent):
+        async for result in self._edit_queue_command(event, "队列置顶", "move", 1):
+            yield result
+
+    @filter.command("清理音乐卡片")
+    async def on_cleanup_music_cards(self, event: AstrMessageEvent):
+        if not self._is_kook(event):
+            return
+        guild_id = self._get_guild_id(event)
+        channel_id = self._get_channel_id(event)
+        if not guild_id or not await is_guild_admin(self._kook_token, guild_id, str(event.get_sender_id())):
+            yield event.plain_result("❌ 只有 KOOK 服务器管理员可清理历史播放卡片")
+            return
+        self._remember_card_scope(guild_id, channel_id)
+        count = await self._reconcile_music_cards(guild_id, channel_id, pages=10)
+        if count is None:
+            yield event.plain_result("❌ 读取卡片历史失败，请稍后重试")
+            return
+        deleted = await self._cleanup_pending_cards()
+        self._card_cleanup_wake.set()
+        yield event.plain_result(f"✅ 已识别 {count} 张旧播放卡片，本轮删除 {deleted} 张；剩余将在后台重试。正在播放的卡片会保留。")
 
     @filter.command("队列插队")
     async def on_queue_jump(self, event: AstrMessageEvent):
@@ -818,7 +912,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
             return
 
         raw_text = event.message_str.strip()
-        for prefix in ("队列插队", "/队列插队"):
+        for prefix in ("#队列插队", "/队列插队", "队列插队"):
             if raw_text.startswith(prefix):
                 raw_text = raw_text[len(prefix):].strip()
                 break
@@ -1252,18 +1346,21 @@ class KookMusicPlugin(MusicAuthMixin, Star):
         expected_session=None, expected_song=None,
     ) -> str | None:
         """发送卡片并记录 msg_id（先删旧卡片再发新卡片）"""
+        operation_token = self._kook_token
         def still_current():
-            return expected_session is None or (
+            return self._kook_token == operation_token and (expected_session is None or (
                 self.voice_manager.sessions.get(guild_id) is expected_session
                 and expected_session.current_song is expected_song
                 and expected_session.is_playing
-            )
+            ))
 
         lock = self._card_locks.setdefault(guild_id, asyncio.Lock())
         async with lock:
             if not still_current():
                 return None
+            self._remember_card_scope(guild_id, channel_id, operation_token)
             old_msg_ids = list(self._card_msg_ids.get(guild_id, []))
+            self._retire_card_ids(old_msg_ids)
             failed_msg_ids = await self._delete_card_messages(old_msg_ids)
             if failed_msg_ids:
                 self._card_msg_ids[guild_id] = failed_msg_ids
@@ -1283,7 +1380,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
                         module["startTime"] = now_ms
                         module["endTime"] = now_ms + remaining_ms
             send_task = asyncio.create_task(
-                send_card_message(self._kook_token, channel_id, card_data)
+                send_card_message(operation_token, channel_id, card_data)
             )
             try:
                 msg_id = await asyncio.shield(send_task)
@@ -1295,11 +1392,13 @@ class KookMusicPlugin(MusicAuthMixin, Star):
                 except Exception:
                     msg_id = None
                 if msg_id:
+                    self._ledger_write("track", guild_id, channel_id, operation_token, msg_id, pending=True)
                     failed_msg_ids.extend(await self._delete_card_messages([msg_id]))
                     if failed_msg_ids:
                         self._card_msg_ids[guild_id] = failed_msg_ids
                 raise
             if msg_id:
+                self._ledger_write("track", guild_id, channel_id, operation_token, msg_id, pending=not still_current())
                 if still_current():
                     failed_msg_ids.append(msg_id)
                 else:
@@ -1307,6 +1406,8 @@ class KookMusicPlugin(MusicAuthMixin, Star):
                     msg_id = None
                 if failed_msg_ids:
                     self._card_msg_ids[guild_id] = failed_msg_ids
+            else:
+                self._request_card_reconcile(guild_id)
             return msg_id
 
     async def _delete_card(self, guild_id: str):
@@ -1318,6 +1419,7 @@ class KookMusicPlugin(MusicAuthMixin, Star):
                 return
             # Wait for any in-flight send so a late HTTP response cannot revive the card.
             msg_ids = list(self._card_msg_ids.get(guild_id, []))
+            self._retire_card_ids(msg_ids)
             failed_msg_ids = await self._delete_card_messages(msg_ids)
             if failed_msg_ids:
                 self._card_msg_ids[guild_id] = failed_msg_ids
@@ -1326,10 +1428,12 @@ class KookMusicPlugin(MusicAuthMixin, Star):
 
     async def _delete_card_messages(self, msg_ids: list[str]) -> list[str]:
         """删除播放卡片消息，返回仍未删除成功的 msg_id。"""
-        if not self._kook_token or not msg_ids:
+        if not msg_ids:
             return []
         if isinstance(msg_ids, str):
             msg_ids = [msg_ids]
+        if not self._kook_token:
+            return list(msg_ids)
 
         unique_msg_ids: list[str] = []
         seen: set[str] = set()
@@ -1339,9 +1443,24 @@ class KookMusicPlugin(MusicAuthMixin, Star):
             seen.add(msg_id)
             unique_msg_ids.append(msg_id)
 
-        results = await asyncio.gather(
-            *(self._delete_message_with_retry(msg_id) for msg_id in unique_msg_ids)
-        )
+        ledger = getattr(self, "_card_ledger", None)
+        tracked = set(unique_msg_ids).intersection(ledger.records) if ledger is not None else set()
+        foreign = {
+            mid for mid in tracked
+            if ledger.records[mid]["token_hash"] != ledger.token_hash(self._kook_token)
+        }
+
+        limiter = getattr(self, "_card_delete_limiter", None)
+        if limiter is None:
+            limiter = self._card_delete_limiter = asyncio.Semaphore(2)
+        async def limited_delete(msg_id):
+            if msg_id in foreign:
+                return False
+            async with limiter:
+                return await self._delete_message_with_retry(msg_id)
+        results = await asyncio.gather(*(limited_delete(msg_id) for msg_id in unique_msg_ids))
+        if ledger is not None:
+            results = [ok or mid in tracked - foreign and mid not in ledger.records for mid, ok in zip(unique_msg_ids, results)]
         failed_msg_ids = [
             msg_id for msg_id, ok in zip(unique_msg_ids, results) if not ok
         ]
@@ -1349,12 +1468,22 @@ class KookMusicPlugin(MusicAuthMixin, Star):
             logger.warning(
                 f"[KookMusic] 有 {len(failed_msg_ids)} 张播放卡片删除失败，已保留待下次重试"
             )
+        self._ledger_write("forget", [mid for mid, ok in zip(unique_msg_ids, results) if ok])
         return failed_msg_ids
 
     async def _delete_message_with_retry(self, msg_id: str, attempts: int = 3) -> bool:
         """删除 KOOK 消息，短重试以规避偶发接口失败。"""
+        operation_token = self._kook_token
         for attempt in range(attempts):
-            if await delete_message(self._kook_token, msg_id):
+            if self._kook_token != operation_token:
+                return False
+            ledger = getattr(self, "_card_ledger", None)
+            was_tracked = ledger is not None and msg_id in ledger.records
+            if was_tracked and ledger.records[msg_id]["token_hash"] != ledger.token_hash(self._kook_token):
+                return False
+            if await delete_message(operation_token, msg_id):
+                return True
+            if was_tracked and msg_id not in ledger.records:
                 return True
             if attempt < attempts - 1:
                 await asyncio.sleep(0.2 * (attempt + 1))

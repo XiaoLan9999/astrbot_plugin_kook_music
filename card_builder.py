@@ -289,6 +289,7 @@ def build_search_result_card(
 def build_queue_card(
     playlist: list[Song],
     loop_mode: str = "关闭",
+    page: int = 1,
 ) -> dict:
     """构建播放队列卡片"""
     modules = []
@@ -307,11 +308,14 @@ def build_queue_card(
     else:
         # KOOK 单条卡片最多 50 个模块。大型队列仅展示前 100 首，
         # 保证卡片稳定可发送；完整数量仍在底部显示。
-        visible_playlist = playlist[:100]
+        page = max(1, min(page, (len(playlist) + 99) // 100))
+        offset = (page - 1) * 100
+        visible_playlist = playlist[offset:offset + 100]
         lines = []
-        for i, song in enumerate(visible_playlist):
+        for i, song in enumerate(visible_playlist, offset):
             prefix = "▶" if i == 0 else f"{i + 1}"
-            lines.append(f"**{prefix}.** {song.display_name}")
+            owner = f" · {song.requester_name}" if song.requester_name else ""
+            lines.append(f"**{prefix}.** {song.display_name}{owner}")
         for start in range(0, len(lines), 10):
             modules.append({
                 "type": "section",
@@ -323,13 +327,17 @@ def build_queue_card(
                 "text": {
                     "type": "kmarkdown",
                     "content": (
-                        f"_队列较长，仅展示前 {len(visible_playlist)} 首；"
-                        f"其余 {len(playlist) - len(visible_playlist)} 首仍会正常播放。_"
+                        f"_第 {page}/{(len(playlist) + 99) // 100} 页，显示 {offset + 1}-{offset + len(visible_playlist)}；"
+                        "使用 歌单 页码 查看其它页。_"
                     ),
                 },
             })
 
     modules.append({"type": "divider"})
+    modules.append({
+        "type": "section",
+        "text": {"type": "kmarkdown", "content": "编辑待播：`队列删除 5` · `队列移动 8 3` · `队列置顶 8`\n序号 1 为当前曲目，不可编辑；普通用户仅可操作自己点的歌曲。"},
+    })
     modules.append({
         "type": "context",
         "elements": [{

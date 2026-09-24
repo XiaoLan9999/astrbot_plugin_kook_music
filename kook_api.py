@@ -2,24 +2,133 @@
 KOOK REST API 辅助工具。
 用于发送/删除/更新卡片消息等操作。
 """
+
 import asyncio
 import copy
 import email.utils
+import hashlib
 import json
 import logging
+import re
+import secrets
 import time
+from dataclasses import dataclass
 
 import aiohttp
+
+from .kook_events import enum_value, event_field
 
 logger = logging.getLogger("astrbot")
 
 KOOK_API_BASE = "https://www.kookapp.cn/api/v3"
 _COUNTDOWN_START_OFFSET_MS = 500
 _MIN_COUNTDOWN_DURATION_MS = 1000
+_CARD_HTTP_TIMEOUT = 10
+_CARD_RECEIPT_GRACE = 2
+_MAX_PENDING_CARD_RECEIPTS = 128
+_SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 # 模块级共享 session（避免每次 API 调用都创建新连接）
 _shared_session: aiohttp.ClientSession | None = None
 _server_time_offset_ms = 0
+
+
+@dataclass
+class _CardReceipt:
+    token_hash: bytes
+    channel_id: str
+    future: asyncio.Future
+    request_task: asyncio.Task | None = None
+
+
+@dataclass
+class _CardAttempt:
+    msg_id: str | None = None
+    countdown_rejected: bool = False
+    uncertain: bool = False
+
+
+_pending_card_receipts: dict[str, _CardReceipt] = {}
+
+
+def _safe_id(value) -> bool:
+    return isinstance(value, str) and _SAFE_ID.fullmatch(value) is not None
+
+
+def _token_hash(token):
+    if (
+        not isinstance(token, str)
+        or not token
+        or any(ord(char) < 32 or ord(char) == 127 for char in token)
+    ):
+        return None
+    try:
+        return hashlib.sha256(token.encode("utf-8")).digest()
+    except UnicodeError:
+        return None
+
+
+def _log_api_failure(stage, *, http=None, data=None, error=None):
+    code = data.get("code") if isinstance(data, dict) else None
+    logger.warning(
+        "[KookMusic] KOOK API stage=%s http=%s code=%s error=%s",
+        stage,
+        http if type(http) is int and 100 <= http <= 599 else "unknown",
+        code if type(code) is int and -10000000 <= code <= 10000000 else "unknown",
+        type(error).__name__ if error is not None else "none",
+    )
+
+
+def observe_card_receipt(token: str, bot_user_id: str, event) -> bool:
+    """Correlate a self-authored gateway card with an outstanding HTTP attempt."""
+    if event_field(event, "type") is None:
+        signal = event_field(event, "s", event_field(event, "signal"))
+        if enum_value(signal) == 0:
+            event = event_field(event, "d", event_field(event, "data"))
+    if (
+        enum_value(event_field(event, "type")) != 10
+        or enum_value(event_field(event, "channel_type")) != "GROUP"
+        or not _safe_id(bot_user_id)
+        or event_field(event, "author_id") != bot_user_id
+    ):
+        return False
+    nonce = event_field(event, "nonce")
+    if not isinstance(nonce, str):
+        return False
+    receipt = _pending_card_receipts.get(nonce)
+    if (
+        receipt is None
+        or receipt.future.done()
+        or receipt.token_hash != _token_hash(token)
+        or event_field(event, "target_id") != receipt.channel_id
+    ):
+        return False
+    msg_id = event_field(event, "msg_id")
+    if not _safe_id(msg_id):
+        return False
+    receipt.future.set_result(msg_id)
+    return True
+
+
+def _register_card_receipt(token, channel_id):
+    token_hash = _token_hash(token)
+    if token_hash is None or not _safe_id(channel_id):
+        _log_api_failure("CARD_INPUT")
+        return None
+    for nonce, receipt in tuple(_pending_card_receipts.items()):
+        if receipt.future.done() or receipt.future.get_loop().is_closed():
+            _pending_card_receipts.pop(nonce, None)
+    if len(_pending_card_receipts) >= _MAX_PENDING_CARD_RECEIPTS:
+        _log_api_failure("CARD_RECEIPT_CAPACITY")
+        return None
+    nonce = secrets.token_hex(16)
+    while nonce in _pending_card_receipts:
+        nonce = secrets.token_hex(16)
+    receipt = _CardReceipt(
+        token_hash, channel_id, asyncio.get_running_loop().create_future()
+    )
+    _pending_card_receipts[nonce] = receipt
+    return nonce, receipt
 
 
 async def _get_session() -> aiohttp.ClientSession:
@@ -45,6 +154,16 @@ async def _get_session() -> aiohttp.ClientSession:
 async def close_shared_session():
     """关闭共享 session（插件卸载时调用）"""
     global _shared_session
+    tasks = []
+    for receipt in tuple(_pending_card_receipts.values()):
+        if not receipt.future.done():
+            receipt.future.cancel()
+        if receipt.request_task is not None:
+            receipt.request_task.cancel()
+            tasks.append(receipt.request_task)
+    _pending_card_receipts.clear()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
     if _shared_session and not _shared_session.closed:
         await _shared_session.close()
     _shared_session = None
@@ -52,10 +171,18 @@ async def close_shared_session():
 
 def _is_countdown_validation_error(data: dict) -> bool:
     """判断 KOOK 是否因为 countdown 模块拒绝了卡片。"""
+    if (
+        not isinstance(data, dict)
+        or type(data.get("code")) is not int
+        or data["code"] == 0
+    ):
+        return False
     details = data.get("data", [])
     if isinstance(details, str):
         details = [details]
-    return any("countdown" in str(item) for item in details)
+    return isinstance(details, list) and any(
+        isinstance(item, str) and "countdown" in item.lower() for item in details
+    )
 
 
 def _sync_server_time_from_response(resp: aiohttp.ClientResponse):
@@ -136,13 +263,15 @@ def _replace_countdown_with_text(card_data: list[dict]) -> list[dict]:
                 else:
                     remaining_ms = 0
                 remaining_seconds = max(1, remaining_ms // 1000)
-                new_modules.append({
-                    "type": "section",
-                    "text": {
-                        "type": "kmarkdown",
-                        "content": f"**歌曲剩余：** {remaining_seconds} 秒",
-                    },
-                })
+                new_modules.append(
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "kmarkdown",
+                            "content": f"**歌曲剩余：** {remaining_seconds} 秒",
+                        },
+                    }
+                )
             else:
                 new_modules.append(module)
         card["modules"] = new_modules
@@ -160,7 +289,7 @@ def _repair_countdown_modules(card_data: list[dict]) -> list[dict]:
     """修复 countdown 时间戳，使用最新 KOOK 服务器时间重算。"""
     repaired = copy.deepcopy(card_data)
     now_ms = _server_now_ms()
-    start_ms = now_ms + _COUNTDOWN_START_OFFSET_MS
+    repaired_start_ms = now_ms + _COUNTDOWN_START_OFFSET_MS
 
     for card in repaired:
         if not isinstance(card, dict):
@@ -184,8 +313,8 @@ def _repair_countdown_modules(card_data: list[dict]) -> list[dict]:
                 duration_ms = _MIN_COUNTDOWN_DURATION_MS
 
             module["mode"] = module.get("mode") or "second"
-            module["startTime"] = start_ms
-            module["endTime"] = start_ms + duration_ms
+            module["startTime"] = repaired_start_ms
+            module["endTime"] = repaired_start_ms + duration_ms
 
     return repaired
 
@@ -220,17 +349,18 @@ async def send_text_message(
             headers=headers,
             json=payload,
             timeout=aiohttp.ClientTimeout(total=10),
+            allow_redirects=False,
         ) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("code") == 0:
                     return data.get("data", {}).get("msg_id", "")
                 else:
-                    logger.debug(f"[KookMusic] 发送文本消息失败: {data}")
+                    _log_api_failure("TEXT_REJECTED", http=resp.status, data=data)
             else:
-                logger.debug(f"[KookMusic] 发送文本消息 HTTP 错误: {resp.status}")
-    except Exception as e:
-        logger.debug(f"[KookMusic] 发送文本消息异常: {e}")
+                _log_api_failure("TEXT_HTTP", http=resp.status)
+    except Exception as exc:
+        _log_api_failure("TEXT_SEND", error=exc)
     return None
 
 
@@ -239,100 +369,117 @@ async def send_card_message(
     channel_id: str,
     card_data: dict | list[dict],
 ) -> str | None:
-    """
-    发送卡片消息并返回 msg_id。
-
-    Args:
-        token: Bot Token
-        channel_id: 目标频道 ID
-        card_data: 卡片数据（单个 dict 或列表）
-
-    Returns:
-        发送成功返回 msg_id，失败返回 None
-    """
-    if isinstance(card_data, dict):
-        card_data = [card_data]
-    card_data = _normalize_countdown_modules(card_data)
-
-    headers = {"Authorization": f"Bot {token}"}
-    payload = {
-        "target_id": channel_id,
-        "content": json.dumps(card_data),
-        "type": 10,  # CARD 类型
-    }
-
+    """Return the first authenticated HTTP/gateway receipt; never retry ambiguity."""
     try:
+        if isinstance(card_data, dict):
+            card_data = [card_data]
+        if (
+            not isinstance(card_data, list)
+            or not card_data
+            or not all(isinstance(card, dict) for card in card_data)
+        ):
+            _log_api_failure("CARD_INPUT")
+            return None
+        normalized = _normalize_countdown_modules(card_data)
         session = await _get_session()
-        async with session.post(
-            f"{KOOK_API_BASE}/message/create",
-            headers=headers,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            _sync_server_time_from_response(resp)
-            if resp.status == 200:
+        candidate = normalized
+        for attempt in range(3):
+            result = await _send_card_attempt(session, token, channel_id, candidate)
+            if result.msg_id:
+                return result.msg_id
+            if not result.countdown_rejected:
+                return None
+            if attempt == 0:
+                candidate = _repair_countdown_modules(normalized)
+            elif attempt == 1:
+                candidate = _replace_countdown_with_text(normalized)
+        return None
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log_api_failure("CARD_SEND", error=exc)
+        return None
+
+
+async def _post_card_attempt(session, token, payload):
+    try:
+        async with asyncio.timeout(_CARD_HTTP_TIMEOUT):
+            async with session.post(
+                f"{KOOK_API_BASE}/message/create",
+                headers={"Authorization": f"Bot {token}"},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=_CARD_HTTP_TIMEOUT),
+                allow_redirects=False,
+            ) as resp:
+                _sync_server_time_from_response(resp)
+                if resp.status != 200:
+                    _log_api_failure("CARD_HTTP", http=resp.status)
+                    return _CardAttempt(uncertain=True)
                 data = await resp.json()
-                if data.get("code") == 0:
-                    msg_id = data.get("data", {}).get("msg_id", "")
-                    return msg_id
-                if _is_countdown_validation_error(data):
-                    logger.warning(
-                        f"[KookMusic] countdown 校验失败，修正倒计时时间戳后重发卡片: {data}"
+                if not isinstance(data, dict) or type(data.get("code")) is not int:
+                    _log_api_failure("CARD_RESPONSE", http=resp.status)
+                    return _CardAttempt(uncertain=True)
+                if data["code"] == 0:
+                    result = data.get("data")
+                    msg_id = result.get("msg_id") if isinstance(result, dict) else None
+                    if _safe_id(msg_id):
+                        return _CardAttempt(msg_id=msg_id)
+                    _log_api_failure(
+                        "CARD_RECEIPT_MISSING", http=resp.status, data=data
                     )
-                    fallback_payload = {
-                        "target_id": channel_id,
-                        "content": json.dumps(_repair_countdown_modules(card_data)),
-                        "type": 10,
-                    }
-                    async with session.post(
-                        f"{KOOK_API_BASE}/message/create",
-                        headers=headers,
-                        json=fallback_payload,
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as retry_resp:
-                        _sync_server_time_from_response(retry_resp)
-                        if retry_resp.status == 200:
-                            retry_data = await retry_resp.json()
-                            if retry_data.get("code") == 0:
-                                return retry_data.get("data", {}).get("msg_id", "")
-                            if _is_countdown_validation_error(retry_data):
-                                logger.warning(
-                                    f"[KookMusic] 修正倒计时后仍校验失败，改用文本剩余时间后重发卡片: {retry_data}"
-                                )
-                                stripped_payload = {
-                                    "target_id": channel_id,
-                                    "content": json.dumps(_replace_countdown_with_text(card_data)),
-                                    "type": 10,
-                                }
-                                async with session.post(
-                                    f"{KOOK_API_BASE}/message/create",
-                                    headers=headers,
-                                    json=stripped_payload,
-                                    timeout=aiohttp.ClientTimeout(total=10),
-                                ) as stripped_resp:
-                                    _sync_server_time_from_response(stripped_resp)
-                                    if stripped_resp.status == 200:
-                                        stripped_data = await stripped_resp.json()
-                                        if stripped_data.get("code") == 0:
-                                            return stripped_data.get("data", {}).get("msg_id", "")
-                                        logger.error(f"[KookMusic] 文本剩余时间发送卡片失败: {stripped_data}")
-                                    else:
-                                        logger.error(
-                                            f"[KookMusic] 文本剩余时间发送卡片 HTTP 错误: {stripped_resp.status}"
-                                        )
-                            else:
-                                logger.error(f"[KookMusic] 修正倒计时后发送卡片失败: {retry_data}")
-                        else:
-                            logger.error(
-                                f"[KookMusic] 修正倒计时后发送卡片 HTTP 错误: {retry_resp.status}"
-                            )
-                else:
-                    logger.error(f"[KookMusic] 发送卡片失败: {data}")
-            else:
-                logger.error(f"[KookMusic] 发送卡片 HTTP 错误: {resp.status}")
-    except Exception as e:
-        logger.error(f"[KookMusic] 发送卡片异常: {e}")
-    return None
+                    return _CardAttempt(uncertain=True)
+                _log_api_failure("CARD_REJECTED", http=resp.status, data=data)
+                return _CardAttempt(
+                    countdown_rejected=_is_countdown_validation_error(data)
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log_api_failure("CARD_HTTP", error=exc)
+        return _CardAttempt(uncertain=True)
+
+
+async def _send_card_attempt(session, token, channel_id, card_data):
+    registered = _register_card_receipt(token, channel_id)
+    if registered is None:
+        return _CardAttempt()
+    nonce, receipt = registered
+    request_task = None
+    try:
+        # nonce is correlation only: KOOK does not promise idempotent delivery.
+        payload = {
+            "target_id": channel_id,
+            "content": json.dumps(card_data),
+            "type": 10,
+            "nonce": nonce,
+        }
+        request_task = asyncio.create_task(_post_card_attempt(session, token, payload))
+        receipt.request_task = request_task
+        await asyncio.wait(
+            {request_task, receipt.future}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if receipt.future.cancelled():
+            raise asyncio.CancelledError
+        if receipt.future.done():
+            return _CardAttempt(msg_id=receipt.future.result())
+        result = request_task.result()
+        if result.uncertain:
+            try:
+                async with asyncio.timeout(_CARD_RECEIPT_GRACE):
+                    msg_id = await asyncio.shield(receipt.future)
+                return _CardAttempt(msg_id=msg_id)
+            except TimeoutError:
+                _log_api_failure("CARD_UNCONFIRMED")
+        return result
+    finally:
+        if _pending_card_receipts.get(nonce) is receipt:
+            _pending_card_receipts.pop(nonce, None)
+        if not receipt.future.done():
+            receipt.future.cancel()
+        if request_task is not None:
+            if not request_task.done():
+                request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
 
 
 async def delete_message(token: str, msg_id: str) -> bool:
@@ -359,17 +506,22 @@ async def delete_message(token: str, msg_id: str) -> bool:
             headers=headers,
             json=payload,
             timeout=aiohttp.ClientTimeout(total=10),
+            allow_redirects=False,
         ) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                if data.get("code") == 0:
+                if (
+                    isinstance(data, dict)
+                    and type(data.get("code")) is int
+                    and data["code"] == 0
+                ):
                     return True
                 else:
-                    logger.debug(f"[KookMusic] 删除消息失败: {data}")
+                    _log_api_failure("DELETE_REJECTED", http=resp.status, data=data)
             else:
-                logger.debug(f"[KookMusic] 删除消息 HTTP 错误: {resp.status}")
-    except Exception as e:
-        logger.debug(f"[KookMusic] 删除消息异常: {e}")
+                _log_api_failure("DELETE_HTTP", http=resp.status)
+    except Exception as exc:
+        _log_api_failure("DELETE_SEND", error=exc)
     return False
 
 
@@ -408,15 +560,72 @@ async def update_card_message(
             headers=headers,
             json=payload,
             timeout=aiohttp.ClientTimeout(total=10),
+            allow_redirects=False,
         ) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("code") == 0:
                     return True
                 else:
-                    logger.debug(f"[KookMusic] 更新消息失败: {data}")
+                    _log_api_failure("UPDATE_REJECTED", http=resp.status, data=data)
             else:
-                logger.debug(f"[KookMusic] 更新消息 HTTP 错误: {resp.status}")
-    except Exception as e:
-        logger.debug(f"[KookMusic] 更新消息异常: {e}")
+                _log_api_failure("UPDATE_HTTP", http=resp.status)
+    except Exception as exc:
+        _log_api_failure("UPDATE_SEND", error=exc)
     return False
+
+
+async def _get_api_data(token, endpoint, params, stage):
+    if _token_hash(token) is None:
+        _log_api_failure(stage + "_INPUT")
+        return None
+    try:
+        session = await _get_session()
+        async with session.get(
+            f"{KOOK_API_BASE}/{endpoint}",
+            headers={"Authorization": f"Bot {token}"},
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=10),
+            allow_redirects=False,
+        ) as resp:
+            if resp.status != 200:
+                _log_api_failure(stage + "_HTTP", http=resp.status)
+                return None
+            data = await resp.json()
+            if (
+                isinstance(data, dict)
+                and type(data.get("code")) is int
+                and data["code"] == 0
+                and isinstance(data.get("data"), dict)
+            ):
+                return data["data"]
+            _log_api_failure(stage + "_RESPONSE", http=resp.status, data=data)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log_api_failure(stage + "_REQUEST", error=exc)
+    return None
+
+
+async def get_channel_messages(
+    token: str, channel_id: str, before: str = "", page_size: int = 50
+) -> dict | None:
+    """Fetch one bounded page; callers must enforce their own cleanup scope."""
+    if (
+        not _safe_id(channel_id)
+        or before != ""
+        and not _safe_id(before)
+        or type(page_size) is not int
+        or not 1 <= page_size <= 50
+    ):
+        _log_api_failure("HISTORY_INPUT")
+        return None
+    params = {"target_id": channel_id, "page_size": page_size}
+    if before:
+        params.update({"msg_id": before, "flag": "before"})
+    return await _get_api_data(token, "message/list", params, "HISTORY")
+
+
+async def get_bot_identity(token: str) -> dict | None:
+    """Return the current token's user/me data without logging account details."""
+    return await _get_api_data(token, "user/me", {}, "IDENTITY")

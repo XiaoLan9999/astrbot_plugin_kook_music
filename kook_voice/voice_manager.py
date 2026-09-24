@@ -180,6 +180,7 @@ class VoiceManager:
         is_admin: bool = False,
         expected_session: GuildSession | None = None,
         position: int | None = None,
+        destination: int | None = None,
     ) -> tuple[bool, str]:
         """在执行前原子检查当前点歌者，供按钮及文字命令共用。"""
         lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
@@ -192,14 +193,28 @@ class VoiceManager:
             actor_id = str(actor_id or "").strip()
             if not actor_id:
                 return False, "无法确认操作用户，已拒绝操作"
-            song = self.control_song(session)
+            queue_edit = action in {"move", "remove", "reorder"}
+            if session.pending_skips > 0 and (queue_edit or action == "clear"):
+                return False, "正在切换歌曲，请稍后再调整队列"
+            if queue_edit:
+                error = self._queue_position_error(session, position)
+                if error:
+                    return False, error
+                if action == "reorder":
+                    error = self._queue_position_error(session, destination)
+                    if error:
+                        return False, error
+                song = session.playlist[position - 1]
+            else:
+                song = self.control_song(session)
             requester_id = str(song.requester_id or "").strip() if song else ""
             if is_admin is not True and (
                 not requester_id or actor_id != requester_id
             ):
-                return False, "只有当前歌曲的点歌者或管理员可以调整播放"
-            if session.pending_skips > 0 and action in {"move", "clear"}:
-                return False, "正在切换歌曲，请稍后再调整队列"
+                return False, (
+                    "只有该歌曲的点歌者或管理员可以调整这首待播歌曲"
+                    if queue_edit else "只有当前歌曲的点歌者或管理员可以调整播放"
+                )
 
             # 下列入口在首个 await 前完成状态变更；鉴权到提交之间不能让出执行权。
             if action == "next":
@@ -211,9 +226,11 @@ class VoiceManager:
             if action == "stop":
                 return await self._stop_playback(session)
             if action == "move":
-                if not isinstance(position, int) or isinstance(position, bool):
-                    return False, "请提供有效的歌曲序号"
                 return await self.move_to_next(guild_id, position)
+            if action == "remove":
+                return await self.remove_queued_song(guild_id, position)
+            if action == "reorder":
+                return await self.reorder_queued_song(guild_id, position, destination)
             if action == "leave":
                 await self._cleanup_session(guild_id, expected_session=session)
                 return True, "已退出语音频道"
@@ -523,6 +540,10 @@ class VoiceManager:
         session = self.sessions.get(guild_id)
         if not session:
             return False, "Bot 不在语音频道中"
+        if session.pending_skips > 0:
+            return False, "正在切换歌曲，请稍后再调整队列"
+        if not isinstance(position, int) or isinstance(position, bool):
+            return False, "请提供有效的歌曲序号"
         if not session.playlist:
             return False, "播放队列为空"
         if position < 1 or position > len(session.playlist):
@@ -536,6 +557,60 @@ class VoiceManager:
         session.playlist.insert(1, song)
         self._sync_prefetch(session)
         return True, f"已将第 {position} 首插队到下一首：{song.display_name}"
+
+    @staticmethod
+    def _queue_position_error(session: GuildSession, position: int | None) -> str:
+        if not isinstance(position, int) or isinstance(position, bool):
+            return "请提供有效的歌曲序号"
+        if not session.playlist:
+            return "播放队列为空"
+        if position < 1 or position > len(session.playlist):
+            return f"请输入 1-{len(session.playlist)} 之间的序号"
+        if position == 1:
+            return "第 1 首正在播放或准备中，不能删除或移动"
+        return ""
+
+    async def remove_queued_song(self, guild_id: str, position: int) -> tuple[bool, str]:
+        """Remove one pending item without interrupting the current audio."""
+        session = self.sessions.get(guild_id)
+        if not session:
+            return False, "Bot 不在语音频道中"
+        if session.pending_skips > 0:
+            return False, "正在切换歌曲，请稍后再调整队列"
+        error = self._queue_position_error(session, position)
+        if error:
+            return False, error
+        song = session.playlist.pop(position - 1)
+        self._sync_prefetch(session)
+        # Repeated queue entries can share one Song or cache file. Its surviving
+        # owner, especially the current player, must keep that resource alive.
+        if not any(queued is song for queued in session.playlist):
+            if song.file_path and any(
+                queued.file_path == song.file_path for queued in session.playlist
+            ):
+                song.file_path = ""
+            self._cleanup_song_file(song)
+        return True, f"已删除第 {position} 首待播歌曲：{song.display_name}"
+
+    async def reorder_queued_song(
+        self, guild_id: str, position: int, destination: int,
+    ) -> tuple[bool, str]:
+        """Move a pending item to its final 1-based queue position."""
+        session = self.sessions.get(guild_id)
+        if not session:
+            return False, "Bot 不在语音频道中"
+        if session.pending_skips > 0:
+            return False, "正在切换歌曲，请稍后再调整队列"
+        for value in (position, destination):
+            error = self._queue_position_error(session, value)
+            if error:
+                return False, error
+        if position == destination:
+            return True, f"第 {position} 首已在目标位置：{session.playlist[position - 1].display_name}"
+        song = session.playlist.pop(position - 1)
+        session.playlist.insert(destination - 1, song)
+        self._sync_prefetch(session)
+        return True, f"已将第 {position} 首移动到第 {destination} 位：{song.display_name}"
 
     async def clear_playlist(self, guild_id: str) -> tuple[bool, str]:
         """清空播放队列（保留当前播放）"""

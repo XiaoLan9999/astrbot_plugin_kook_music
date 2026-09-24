@@ -71,7 +71,12 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(action=action):
                 manager, session = self.make_manager()
                 ok, _ = await asyncio.wait_for(
-                    manager.control("guild", action, actor_id="alice", position=3),
+                    manager.control(
+                        "guild",
+                        action,
+                        actor_id="carol" if action == "move" else "alice",
+                        position=3,
+                    ),
                     timeout=1,
                 )
                 self.assertTrue(ok)
@@ -83,7 +88,9 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
                 elif action == "clear":
                     self.assertEqual([song.id for song in session.playlist], ["0"])
                 elif action == "move":
-                    self.assertEqual([song.id for song in session.playlist], ["0", "2", "1"])
+                    self.assertEqual(
+                        [song.id for song in session.playlist], ["0", "2", "1"]
+                    )
                 else:
                     self.assertNotIn("guild", manager.sessions)
                     session.voice_client.disconnect.assert_awaited_once()
@@ -115,9 +122,9 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeated_skip_allows_consecutive_songs_of_same_requester(self):
         manager, session = self.make_manager(("alice", "alice", "bob"))
-        results = await asyncio.gather(*(
-            manager.control("guild", "next", actor_id="alice") for _ in range(3)
-        ))
+        results = await asyncio.gather(
+            *(manager.control("guild", "next", actor_id="alice") for _ in range(3))
+        )
         self.assertEqual([result[0] for result in results], [True, True, False])
         self.assertEqual(session.pending_skips, 2)
 
@@ -140,9 +147,9 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
                 manager, session = self.make_manager(("alice", "alice", "alice", "bob"))
                 songs = list(session.playlist)
                 for _ in range(2):
-                    self.assertTrue((await manager.control(
-                        "guild", "next", actor_id="alice"
-                    ))[0])
+                    self.assertTrue(
+                        (await manager.control("guild", "next", actor_id="alice"))[0]
+                    )
                 result = await manager.control(
                     "guild", "move", actor_id="alice", is_admin=is_admin, position=4
                 )
@@ -160,9 +167,9 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(is_admin=is_admin):
                 manager, session = self.make_manager(("alice", "alice", "bob"))
                 songs = list(session.playlist)
-                self.assertTrue((await manager.control(
-                    "guild", "next", actor_id="alice"
-                ))[0])
+                self.assertTrue(
+                    (await manager.control("guild", "next", actor_id="alice"))[0]
+                )
                 result = await manager.control(
                     "guild", "clear", actor_id="alice", is_admin=is_admin
                 )
@@ -190,7 +197,9 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
         for requester in ("", "  ", None):
             with self.subTest(requester=requester):
                 manager, session = self.make_manager((requester, "bob"))
-                self.assertFalse((await manager.control("guild", "clear", actor_id="bob"))[0])
+                self.assertFalse(
+                    (await manager.control("guild", "clear", actor_id="bob"))[0]
+                )
                 self.assertEqual(len(session.playlist), 2)
                 result = await manager.control(
                     "guild", "clear", actor_id="moderator", is_admin=True
@@ -201,7 +210,9 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
         manager, session = self.make_manager(())
         for action in ("loop", "clear", "leave"):
             with self.subTest(action=action):
-                self.assertFalse((await manager.control("guild", action, actor_id="alice"))[0])
+                self.assertFalse(
+                    (await manager.control("guild", action, actor_id="alice"))[0]
+                )
         self.assertIs(manager.sessions["guild"], session)
         result = await asyncio.wait_for(
             manager.control("guild", "leave", actor_id="moderator", is_admin=True),
@@ -214,9 +225,9 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
         manager, session = self.make_manager()
         lock = manager._guild_locks.setdefault("guild", asyncio.Lock())
         await lock.acquire()
-        task = asyncio.create_task(manager.control(
-            "guild", "next", actor_id="alice", expected_session=session
-        ))
+        task = asyncio.create_task(
+            manager.control("guild", "next", actor_id="alice", expected_session=session)
+        )
         await asyncio.sleep(0)
         self.assertFalse(task.done())
         session.playlist.pop(0)
@@ -229,9 +240,9 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
         manager, session = self.make_manager()
         lock = manager._guild_locks.setdefault("guild", asyncio.Lock())
         await lock.acquire()
-        task = asyncio.create_task(manager.control(
-            "guild", "loop", actor_id="alice", expected_session=session
-        ))
+        task = asyncio.create_task(
+            manager.control("guild", "loop", actor_id="alice", expected_session=session)
+        )
         await asyncio.sleep(0)
         session.pending_skips = 1
         lock.release()
@@ -242,10 +253,15 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
         manager, session = self.make_manager()
         lock = manager._guild_locks.setdefault("guild", asyncio.Lock())
         await lock.acquire()
-        task = asyncio.create_task(manager.control(
-            "guild", "leave", actor_id="moderator", is_admin=True,
-            expected_session=session,
-        ))
+        task = asyncio.create_task(
+            manager.control(
+                "guild",
+                "leave",
+                actor_id="moderator",
+                is_admin=True,
+                expected_session=session,
+            )
+        )
         await asyncio.sleep(0)
         _, replacement = self.make_manager()
         manager.sessions["guild"] = replacement
@@ -259,9 +275,11 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
         manager, session = self.make_manager()
         lock = manager._guild_locks.setdefault("guild", asyncio.Lock())
         await lock.acquire()
-        task = asyncio.create_task(manager.control(
-            "guild", "clear", actor_id="alice", expected_session=session
-        ))
+        task = asyncio.create_task(
+            manager.control(
+                "guild", "clear", actor_id="alice", expected_session=session
+            )
+        )
         await asyncio.sleep(0)
         manager.sessions.pop("guild")
         lock.release()
@@ -271,7 +289,9 @@ class VoiceControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_action_and_invalid_position_do_not_mutate_state(self):
         manager, session = self.make_manager()
         songs = list(session.playlist)
-        self.assertFalse((await manager.control("guild", "unknown", actor_id="alice"))[0])
+        self.assertFalse(
+            (await manager.control("guild", "unknown", actor_id="alice"))[0]
+        )
         for position in (None, "3", True, 0, 4):
             with self.subTest(position=position):
                 result = await manager.control(
