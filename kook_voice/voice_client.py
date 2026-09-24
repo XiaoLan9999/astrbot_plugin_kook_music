@@ -6,6 +6,7 @@ KOOK 语音频道 WebSocket 客户端。
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
@@ -36,6 +37,7 @@ class VoiceClient:
         self._session: aiohttp.ClientSession | None = None
         self._connected = asyncio.Event()
         self._rtp_ready = asyncio.Event()
+        self._handshake_failed = asyncio.Event()
         self._is_exit = False
         self._tasks: list[asyncio.Task] = []
         self._remote_removed = False
@@ -165,14 +167,73 @@ class VoiceClient:
         await self.disconnect()
         return await self.connect(target_channel, timeout)
 
-    async def _close_old_transport(self, timeout: float = 5.0):
+    @staticmethod
+    def _is_rpc_response(data, request_id) -> bool:
+        return (
+            isinstance(data, dict)
+            and type(data.get("id")) is int
+            and data["id"] == request_id
+            and data.get("response") is True
+            and not data.get("notification")
+            and not data.get("request")
+        )
+
+    @staticmethod
+    def _rpc_succeeded(data) -> bool:
+        return (
+            data.get("ok") is True
+            and not data.get("error")
+            and not data.get("errorCode")
+            and not data.get("errorReason")
+        )
+
+    @staticmethod
+    def _resource_id(value) -> bool:
+        return (
+            isinstance(value, str)
+            and 1 <= len(value) <= 128
+            and value.isascii()
+            and all(char.isalnum() or char in "_-" for char in value)
+        )
+
+    @classmethod
+    def _transport_parameters(cls, data):
+        if not isinstance(data, dict) or not cls._resource_id(data.get("id")):
+            raise ValueError("Invalid voice transport response")
+        ip, port, rtcp_port = data.get("ip"), data.get("port"), data.get("rtcpPort")
+        if (
+            not isinstance(ip, str)
+            or type(port) is not int
+            or type(rtcp_port) is not int
+            or not 1 <= port <= 65535
+            or not 1 <= rtcp_port <= 65535
+        ):
+            raise ValueError("Invalid voice transport response")
+        address = ipaddress.ip_address(ip)
+        host = f"[{address}]" if address.version == 6 else str(address)
+        return data["id"], host, port, rtcp_port
+
+    async def _refresh_rpc(self, payload, timeout):
+        await self._ws.send_json(payload)
+        async with asyncio.timeout(timeout):
+            while True:
+                response = await self._refresh_response.get()
+                if not self._is_rpc_response(response, payload["id"]):
+                    continue
+                if not self._rpc_succeeded(response):
+                    raise RuntimeError(f"Voice RPC {payload['method']} rejected")
+                return response
+
+    async def _close_old_transport(self, timeout: float = 5.0) -> bool:
         """关闭旧的 mediasoup Transport，释放服务端资源。
 
         必须在创建新 Transport 之前调用，否则 KOOK 的 mediasoup
         可能将旧 Producer 绑定在混音输出上，导致新 Transport 的音频被忽略。
         """
-        if not self._transport_id or not self._ws or self._ws.closed:
-            return
+        if not self._ws or self._ws.closed:
+            return False
+        if not self._transport_id:
+            return not self._producer_id
 
         # 先关闭 Producer
         if self._producer_id:
@@ -184,13 +245,10 @@ class VoiceClient:
             }
             try:
                 logger.debug(f"[KookVoice] 关闭旧 Producer: {self._producer_id}")
-                await self._ws.send_json(close_producer)
-                # 等待响应（不关心内容）
-                await asyncio.wait_for(
-                    self._refresh_response.get(), timeout=timeout
-                )
-            except Exception as e:
-                logger.debug(f"[KookVoice] 关闭 Producer 异常（可忽略）: {e}")
+                await self._refresh_rpc(close_producer, timeout)
+            except Exception as error:
+                logger.warning("[KookVoice] closeProducer failed (%s)", type(error).__name__)
+                return False
             self._producer_id = ""
 
         # 再关闭 Transport
@@ -202,14 +260,12 @@ class VoiceClient:
         }
         try:
             logger.debug(f"[KookVoice] 关闭旧 Transport: {self._transport_id}")
-            await self._ws.send_json(close_transport)
-            # 等待响应（不关心内容）
-            await asyncio.wait_for(
-                self._refresh_response.get(), timeout=timeout
-            )
-        except Exception as e:
-            logger.debug(f"[KookVoice] 关闭 Transport 异常（可忽略）: {e}")
+            await self._refresh_rpc(close_transport, timeout)
+        except Exception as error:
+            logger.warning("[KookVoice] closeTransport failed (%s)", type(error).__name__)
+            return False
         self._transport_id = ""
+        return True
 
     async def refresh_rtp(self, timeout: float = 10.0) -> bool:
         """在现有 WebSocket 上重新协商 RTP 传输参数，BOT 不会离开语音频道。
@@ -226,12 +282,15 @@ class VoiceClient:
             or not self._ws
             or self._ws.closed
             or not self._connected.is_set()
+            or not self._rtp_ready.is_set()
+            or self._refreshing
+            or self._is_exit
         ):
-            logger.warning("[KookVoice] WebSocket 未连接，无法刷新 RTP")
+            logger.warning("[KookVoice] Voice transport is not ready for RTP refresh")
             return False
 
+        websocket = self._ws
         self._rtp_ready.clear()
-        old_rtp = self.rtp_url
         self.rtp_url = ""
 
         # 新的 SSRC
@@ -249,7 +308,8 @@ class VoiceClient:
             # ---- 关键步骤：先关闭旧的 Transport/Producer ----
             # 不关闭旧 Transport 会导致 mediasoup 仍将旧 Producer 绑定在
             # 音频混音输出上，新 Transport 的音频被忽略（表现为没有声音）。
-            await self._close_old_transport()
+            if not await self._close_old_transport(timeout=min(5.0, timeout)):
+                return False
 
             # 短暂等待服务端清理
             await asyncio.sleep(0.5)
@@ -263,17 +323,9 @@ class VoiceClient:
             }
 
             logger.debug("[KookVoice] 刷新 RTP: 发送 createPlainTransport")
-            await self._ws.send_json(create_transport)
-
-            # 等待响应
-            transport_data = await asyncio.wait_for(
-                self._refresh_response.get(), timeout=timeout
-            )
-            transport_info = transport_data.get("data", {})
-            transport_id = transport_info.get("id", "")
-            ip = transport_info.get("ip", "")
-            port = transport_info.get("port", 0)
-            rtcp_port = transport_info.get("rtcpPort", 0)
+            transport_data = await self._refresh_rpc(create_transport, timeout)
+            transport_id, ip, port, rtcp_port = self._transport_parameters(transport_data.get("data"))
+            self._transport_id = transport_id
 
             logger.debug(
                 f"[KookVoice] 刷新 RTP: Transport {ip}:{port} (rtcp: {rtcp_port})"
@@ -305,16 +357,20 @@ class VoiceClient:
             }
 
             logger.debug("[KookVoice] 刷新 RTP: 发送 produce")
-            await self._ws.send_json(produce_payload)
-
-            # 等待响应
-            produce_resp = await asyncio.wait_for(
-                self._refresh_response.get(), timeout=timeout
-            )
+            produce_resp = await self._refresh_rpc(produce_payload, timeout)
             # 保存新的 Producer ID
-            new_producer_id = produce_resp.get("data", {}).get("id", "")
+            producer_data = produce_resp.get("data")
+            new_producer_id = producer_data.get("id") if isinstance(producer_data, dict) else None
+            if not self._resource_id(new_producer_id):
+                raise ValueError("Invalid voice producer response")
 
-            if self._remote_removed:
+            if (
+                self._remote_removed
+                or self._is_exit
+                or not self._connected.is_set()
+                or self._ws is not websocket
+                or websocket.closed
+            ):
                 return False
 
             # 更新 RTP 参数
@@ -330,16 +386,9 @@ class VoiceClient:
 
         except asyncio.TimeoutError:
             logger.error("[KookVoice] RTP 刷新超时")
-            # 恢复旧值
-            if not self._remote_removed:
-                self.rtp_url = old_rtp
-                self._rtp_ready.set()
             return False
-        except Exception as e:
-            logger.error(f"[KookVoice] RTP 刷新异常: {e}")
-            if not self._remote_removed:
-                self.rtp_url = old_rtp
-                self._rtp_ready.set()
+        except Exception as error:
+            logger.error("[KookVoice] RTP refresh failed (%s)", type(error).__name__)
             return False
         finally:
             self._refreshing = False
@@ -364,6 +413,7 @@ class VoiceClient:
         self._is_exit = False
         self._connected.clear()
         self._rtp_ready.clear()
+        self._handshake_failed.clear()
 
         try:
             # 获取语音网关 URL
@@ -387,18 +437,19 @@ class VoiceClient:
             # 等待 RTP 准备完成
             ready_task = asyncio.create_task(self._rtp_ready.wait())
             removed_task = asyncio.create_task(self._removed_event.wait())
+            failed_task = asyncio.create_task(self._handshake_failed.wait())
             try:
                 done, _ = await asyncio.wait(
-                    [ready_task, removed_task],
+                    [ready_task, removed_task, failed_task],
                     timeout=timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
-                for waiter in (ready_task, removed_task):
+                for waiter in (ready_task, removed_task, failed_task):
                     if not waiter.done():
                         waiter.cancel()
-                await asyncio.gather(ready_task, removed_task, return_exceptions=True)
-            if not done or self._remote_removed or not self._rtp_ready.is_set():
+                await asyncio.gather(ready_task, removed_task, failed_task, return_exceptions=True)
+            if not done or self._remote_removed or self._handshake_failed.is_set() or not self._rtp_ready.is_set():
                 logger.error("[KookVoice] RTP 协商失败或连接已被远端移除")
                 await self.disconnect()
                 return False
@@ -451,6 +502,11 @@ class VoiceClient:
         self.channel_id = ""
         self.rtp_url = ""
         self.ssrc = 0
+        self._transport_id = ""
+        self._producer_id = ""
+        self._rtp_ip = ""
+        self._rtp_port = 0
+        self._rtcp_port = 0
         logger.info("[KookVoice] 已断开语音连接")
 
     async def _get_gateway(self, channel_id: str) -> str | None:
@@ -531,12 +587,12 @@ class VoiceClient:
 
         # 发送第一步
         logger.debug("[KookVoice] 发送 getRouterRtpCapabilities")
-        await websocket.send_json(payloads["1"])
 
         step = 1
         pending_messages: list[str] = []
 
         try:
+            await websocket.send_json(payloads["1"])
             async for msg in websocket:
                 if self._is_exit or self._ws is not websocket:
                     return
@@ -569,6 +625,18 @@ class VoiceClient:
                         self.mark_remote_removed()
                         return
 
+                    if step <= 4:
+                        expected = payloads[str(step)]
+                        if not self._is_rpc_response(data, expected["id"]):
+                            continue
+                        if not self._rpc_succeeded(data):
+                            logger.warning("[KookVoice] Initial RPC %s rejected", expected["method"])
+                            self._handshake_failed.set()
+                            self._rtp_ready.clear()
+                            return
+                        if step <= 2 and not isinstance(data.get("data"), dict):
+                            raise ValueError("Invalid voice handshake response")
+
                     if step == 1:
                         # 收到 RtpCapabilities → 发送 join
                         logger.debug("[KookVoice] 发送 join")
@@ -581,11 +649,7 @@ class VoiceClient:
                         step = 3
                     elif step == 3:
                         # 收到 transport 信息 → 提取 ip/port → 发送 produce
-                        transport_data = data.get("data", {})
-                        transport_id = transport_data.get("id", "")
-                        self._rtp_ip = transport_data.get("ip", "")
-                        self._rtp_port = transport_data.get("port", 0)
-                        self._rtcp_port = transport_data.get("rtcpPort", 0)
+                        transport_id, self._rtp_ip, self._rtp_port, self._rtcp_port = self._transport_parameters(data.get("data"))
 
                         # 保存 transport ID
                         self._transport_id = transport_id
@@ -601,7 +665,11 @@ class VoiceClient:
                     elif step == 4:
                         # 收到 produce 结果 → RTP 就绪
                         # 保存 producer ID
-                        self._producer_id = data.get("data", {}).get("id", "")
+                        producer_data = data.get("data")
+                        producer_id = producer_data.get("id") if isinstance(producer_data, dict) else None
+                        if not self._resource_id(producer_id):
+                            raise ValueError("Invalid voice producer response")
+                        self._producer_id = producer_id
 
                         # 构建 rtp_url
                         self.rtp_url = (
@@ -615,14 +683,23 @@ class VoiceClient:
                         step = 5
                     else:
                         # 已完成初始协商，处理后续消息
-                        if self._refreshing:
+                        if self._refreshing and isinstance(data, dict) and data.get("response") is True and not data.get("notification") and not data.get("request"):
                             # RTP 刷新正在进行，将响应路由到刷新队列
                             await self._refresh_response.put(data)
 
+            if self._ws is websocket and not self._is_exit:
+                self._rtp_ready.clear()
+                if step <= 4:
+                    self._handshake_failed.set()
+                else:
+                    self._connected.clear()
+
         except asyncio.CancelledError:
             return
-        except Exception as e:
-            logger.error(f"[KookVoice] WebSocket 消息处理异常: {e}")
+        except Exception as error:
+            logger.error("[KookVoice] WebSocket handler failed (%s)", type(error).__name__)
+            self._handshake_failed.set()
+            self._rtp_ready.clear()
 
     async def _ws_ping_loop(self):
         """WebSocket 心跳保活"""

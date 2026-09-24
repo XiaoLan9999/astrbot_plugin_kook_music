@@ -214,14 +214,14 @@ class StopPlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cancelled.is_set())
         self.assertEqual(session.notification_tasks, set())
 
-    async def test_stop_relay_stops_audio_and_marks_refresh_without_leaving(self):
+    async def test_stop_relay_stops_audio_but_retains_healthy_silent_transport(self):
         player = BlockingRelayPlayer()
         manager, session = self.manager([self.song("current")], player)
         manager._start_playback_loop("guild")
         await player.started.wait()
         await manager.control("guild", "stop", actor_id="owner")
-        self.assertFalse(player.is_relay_running)
-        self.assertTrue(session.needs_relay_refresh)
+        self.assertTrue(player.is_relay_running)
+        self.assertFalse(session.needs_relay_refresh)
         self.assertEqual(session.voice_client.disconnect_calls, 0)
 
     async def test_stop_then_new_song_reuses_session_and_plays_normally(self):

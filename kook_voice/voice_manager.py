@@ -662,8 +662,10 @@ class VoiceManager:
             # first stop. The guild lock prevents new playback until this pass.
             await session.ffmpeg_player.stop()
             if isinstance(session.ffmpeg_player, RelayFFmpegPlayer):
-                await session.ffmpeg_player.stop_relay()
-                session.needs_relay_refresh = True
+                # Keep the established RTP clock alive with silence. Recreating
+                # a Producer after every stop can leave KOOK's mixer on the old one.
+                session.needs_relay_refresh = not session.ffmpeg_player.is_relay_running
+                logger.info("[KookMusic] Playback stopped; silent relay retained=%s", not session.needs_relay_refresh)
             else:
                 session.needs_direct_refresh = True
             if preparation_task is not None:
@@ -916,15 +918,12 @@ class VoiceManager:
             if not relay_ok:
                 logger.error("[KookMusic] 中继进程重建失败")
                 return False
+            session.needs_relay_refresh = False
 
         return True
 
     async def _prepare_relay_for_playback(self, session: GuildSession) -> bool:
-        """从空闲状态恢复 relay 推流。
-
-        队列播空后 KOOK 侧旧 Transport/Producer 可能仍占用混音输出，
-        直接复用会表现为歌曲流程正常但没有声音。恢复播放前刷新 RTP 并重建中继。
-        """
+        """Reuse a healthy silent relay; rebuild a broken transport by rejoining."""
         if getattr(session.voice_client, "remote_removed", False):
             return False
         player = session.ffmpeg_player
@@ -933,20 +932,13 @@ class VoiceManager:
         if player.is_relay_running and not session.needs_relay_refresh:
             return True
 
-        logger.info("[KookMusic] 恢复空闲后的 UDP 中继进程...")
+        logger.info("[KookMusic] UDP 中继不可复用，重新连接语音并重建传输...")
         await player.stop_relay()
-
-        if session.voice_client.is_alive:
-            refreshed = await session.voice_client.refresh_rtp()
-            if not refreshed:
-                logger.warning("[KookMusic] RTP 刷新失败，尝试重连语音频道...")
-                if not await session.voice_client.reconnect(session.voice_channel_id):
-                    logger.error("[KookMusic] 语音重连失败")
-                    return False
-        else:
-            if not await session.voice_client.reconnect(session.voice_channel_id):
-                logger.error("[KookMusic] 语音重连失败")
-                return False
+        if not await session.voice_client.reconnect(session.voice_channel_id):
+            logger.error("[KookMusic] 语音重连失败")
+            return False
+        if getattr(session.voice_client, "remote_removed", False):
+            return False
 
         relay_ok = await player.start_relay(
             session.voice_client.rtp_url,
@@ -1461,11 +1453,9 @@ class VoiceManager:
             current_session = self.sessions.get(guild_id)
             queue_empty = is_current() and not current_session.playlist
             if queue_empty and isinstance(current_session.ffmpeg_player, RelayFFmpegPlayer):
-                current_session.needs_relay_refresh = True
-                try:
-                    await current_session.ffmpeg_player.stop_relay()
-                except Exception as e:
-                    logger.debug(f"[KookMusic] 停止空闲中继异常: {e}")
+                # A silent relay is intentionally retained until idle disconnect.
+                current_session.needs_relay_refresh = not current_session.ffmpeg_player.is_relay_running
+                logger.info("[KookMusic] Queue idle; silent relay retained=%s", not current_session.needs_relay_refresh)
             if queue_empty and self.on_playback_finished:
                 try:
                     result = self.on_playback_finished(guild_id)

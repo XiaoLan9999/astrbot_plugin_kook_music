@@ -142,14 +142,33 @@ class VoiceClientRemovalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disconnect_during_rtp_refresh_is_not_a_refresh_response(self):
         client = VoiceClient("token")
-        client._refreshing = True
-        client._ws = FakeWebSocket([
-            {}, {}, {"data": {"id": "transport", "ip": "127.0.0.1", "port": 1}},
-            {"data": {"id": "producer"}},
-            {"notification": True, "method": "disconnect"},
-        ])
+
+        class HandshakeThenDisconnect(FakeWebSocket):
+            count = 0
+            observed_ready_before_refresh = False
+
+            async def __anext__(self):
+                self.count += 1
+                if self.count <= 4:
+                    request = self.sent[-1]
+                    data = {}
+                    if request["method"] == "createPlainTransport":
+                        data = {"id": "transport", "ip": "127.0.0.1", "port": 20000, "rtcpPort": 20001}
+                    elif request["method"] == "produce":
+                        data = {"id": "producer"}
+                    payload = {"response": True, "ok": True, "id": request["id"], "data": data}
+                else:
+                    self.observed_ready_before_refresh = client.is_rtp_ready
+                    client._refreshing = True
+                    payload = {"notification": True, "method": "disconnect"}
+                return SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(payload))
+
+        socket = HandshakeThenDisconnect()
+        client._ws = socket
         await client._ws_message_handler()
         await client._removal_task
+        self.assertTrue(socket.observed_ready_before_refresh)
+        self.assertEqual([request["method"] for request in socket.sent], ["getRouterRtpCapabilities", "join", "createPlainTransport", "produce"])
         self.assertTrue(client.remote_removed)
         self.assertTrue(client._refresh_response.empty())
         self.assertFalse(client.is_rtp_ready)
