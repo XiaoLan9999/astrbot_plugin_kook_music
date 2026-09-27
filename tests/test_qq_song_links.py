@@ -11,6 +11,7 @@ if str(PLUGINS_DIR) not in sys.path:
 from astrbot_plugin_kook_music.music.model import Song
 from astrbot_plugin_kook_music.music.playlist_import import PlaylistImporter
 from astrbot_plugin_kook_music.music.searcher import MusicSearcher
+from astrbot_plugin_kook_music.music.link_router import MusicLinkResult, resolve_music_link
 from test_playlist_platforms import FakeResponse, FakeSession
 from test_main_bilibili_flow import _FakeEvent, main_module
 
@@ -202,7 +203,10 @@ class QQSongLinkAsyncTests(unittest.IsolatedAsyncioTestCase):
         plugin._play_song = AsyncMock()
         event = _FakeEvent()
         event.message_str = f"点歌&#x20;[{SHORT}]({SHORT})"
-        with patch.object(main_module, "send_text_message", AsyncMock(return_value="progress")):
+        with (
+            patch.object(main_module, "send_text_message", AsyncMock(return_value="progress")),
+            patch.object(main_module, "resolve_music_link", lambda text: resolve_music_link(text, session)),
+        ):
             replies = [reply async for reply in plugin.on_play_music(event)]
         self.assertEqual(replies, [])
         self.assertEqual(session.get_calls[0][0][0], SHORT)
@@ -222,7 +226,12 @@ class QQSongLinkAsyncTests(unittest.IsolatedAsyncioTestCase):
         plugin.searcher = type("Searcher", (), {"fetch_direct_song": AsyncMock(return_value=failed)})()
         event = _FakeEvent()
         event.message_str = f"点歌 {SHORT}"
-        with patch.object(main_module, "send_text_message", AsyncMock(return_value="progress")):
+        with (
+            patch.object(main_module, "send_text_message", AsyncMock(return_value="progress")),
+            patch.object(main_module, "resolve_music_link", AsyncMock(
+                return_value=MusicLinkResult("song", "qq", SHORT)
+            )),
+        ):
             replies = [reply async for reply in plugin.on_play_music(event)]
         self.assertTrue(any("暂时不可用" in reply for reply in replies))
         plugin.searcher.fetch_direct_song.assert_awaited_once()

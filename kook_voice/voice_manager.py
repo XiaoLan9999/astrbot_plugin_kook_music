@@ -114,6 +114,9 @@ class VoiceManager:
         streaming_mode: str = "relay",
         max_queue_size: int = 50,
         prefetch_next: bool = True,
+        stream_startup_buffer_seconds: int = 15,
+        stream_max_buffer_seconds: int = 120,
+        stream_rebuffer_seconds: int = 5,
     ):
         self.max_sessions = max_sessions
         self.auto_leave_timeout = auto_leave_timeout
@@ -122,6 +125,9 @@ class VoiceManager:
         self.streaming_mode = streaming_mode  # "direct" or "relay"
         self.max_queue_size = max_queue_size
         self.prefetch_next = prefetch_next
+        self.stream_startup_buffer_seconds = stream_startup_buffer_seconds
+        self.stream_max_buffer_seconds = stream_max_buffer_seconds
+        self.stream_rebuffer_seconds = stream_rebuffer_seconds
         self.sessions: dict[str, GuildSession] = {}
         self._pending_sessions: dict[str, GuildSession] = {}
         self._initialization_tasks: dict[str, asyncio.Task] = {}
@@ -1263,6 +1269,12 @@ class VoiceManager:
                     play_options["start_seconds"] = resume_offset
                 if is_relay:
                     # ---- relay 模式：直接播放，不需要 RTP 参数 ----
+                    if song.stream_url:
+                        play_options.update(
+                            startup_buffer_seconds=self.stream_startup_buffer_seconds,
+                            max_buffer_seconds=self.stream_max_buffer_seconds,
+                            rebuffer_seconds=self.stream_rebuffer_seconds,
+                        )
                     ok = await player.play(
                         playback_source,
                         **play_options,

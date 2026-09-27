@@ -9,12 +9,14 @@ FFmpeg 进程管理器。
 歌曲解码为有界缓冲的 PCM，由 20ms 节拍写入常驻编码器；无歌曲时填充静音。
 避免 MPEGTS 探测丢失首段音频，以及切歌时各歌曲时间戳归零。
 """
+
 import asyncio
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger("astrbot")
 _HTTPS_URL_PATTERN = re.compile(r"https://[^\s\"'<>]+", re.IGNORECASE)
@@ -262,9 +264,18 @@ class _PCMTrack:
     has_audio: bool = False
     played_bytes: int = 0
     decoded: bool = False
+    failed_eof: bool = False
     exit_code: int | None = None
     decoder_task: asyncio.Task | None = None
     stderr_task: asyncio.Task | None = None
+    startup_frames: int = 1
+    rebuffer_frames: int = 0
+    controlled_buffering: bool = False
+    buffering: bool = False
+    buffer_target: int = 1
+    buffer_started_at: float | None = None
+    buffering_elapsed: float = 0.0
+    cleanup_task: asyncio.Task | None = None
 
 
 class RelayFFmpegPlayer:
@@ -275,6 +286,7 @@ class RelayFFmpegPlayer:
     FRAME_BYTES = 3840  # 960 stereo signed 16-bit samples.
     WARMUP_SECONDS = 2.0
     SOURCE_READY_TIMEOUT = 30.0
+    MAX_BUFFER_SECONDS = 300.0
 
     def __init__(self, ffmpeg_path: str = "ffmpeg", volume: float = 0.15):
         self.volume = volume
@@ -294,6 +306,93 @@ class RelayFFmpegPlayer:
     def played_seconds(self) -> float:
         """Media emitted this play(), excluding relay warmup/underflow silence."""
         return self._song.played_bytes / (self.SAMPLE_RATE * 4) if self._song else 0.0
+
+    @property
+    def buffered_seconds(self) -> float:
+        track = self._song
+        return track.frames.qsize() * self.FRAME_BYTES / (self.SAMPLE_RATE * 4) if track else 0.0
+
+    @property
+    def is_buffering(self) -> bool:
+        return bool(self._song and self._song.buffering and not self._song.done.is_set())
+
+    @classmethod
+    def _buffer_settings(cls, startup, maximum, refill):
+        def seconds(value, default):
+            try:
+                value = float(value) if not isinstance(value, bool) else default
+            except (ValueError, TypeError, OverflowError):
+                value = default
+            if not math.isfinite(value):
+                value = default
+            return min(cls.MAX_BUFFER_SECONDS, max(0.0, value))
+
+        frame_seconds = cls.FRAME_BYTES / (cls.SAMPLE_RATE * 4)
+        startup = seconds(startup, 0.0)
+        refill = seconds(refill, 0.0)
+        maximum = seconds(maximum, 0.5)
+        limit = max(1, math.ceil(maximum / frame_seconds))
+        initial = min(limit, max(1, math.ceil(startup / frame_seconds)))
+        refill_frames = min(limit, math.ceil(refill / frame_seconds))
+        return limit, initial, refill_frames, startup > 0 or refill > 0
+
+    @staticmethod
+    def _buffer_wall_time(track, now):
+        return track.buffering_elapsed + (
+            max(0.0, now - track.buffer_started_at)
+            if track.buffer_started_at is not None else 0.0
+        )
+
+    def _begin_buffering(self, track, target):
+        if track.buffering or track.done.is_set():
+            return
+        track.buffering = True
+        track.buffer_target = max(1, target)
+        track.buffer_started_at = asyncio.get_running_loop().time()
+        logger.debug("[KookMusic] PCM buffer stage=WAIT target_frames=%s", track.buffer_target)
+
+    @staticmethod
+    def _end_buffering(track):
+        if track.buffer_started_at is not None:
+            track.buffering_elapsed += max(0.0, asyncio.get_running_loop().time() - track.buffer_started_at)
+        track.buffer_started_at = None
+        track.buffering = False
+
+    def _release_buffer_if_ready(self, track):
+        if track.done.is_set():
+            return
+        if (
+            track.buffering and track.buffer_started_at is not None
+            and asyncio.get_running_loop().time() - track.buffer_started_at >= self.SOURCE_READY_TIMEOUT
+        ):
+            self._fail_buffered_track(track, "STALL_TIMEOUT")
+            return
+        if track.buffering and (
+            track.frames.qsize() >= track.buffer_target or track.decoded
+        ):
+            self._end_buffering(track)
+            logger.debug("[KookMusic] PCM buffer stage=READY frames=%s", track.frames.qsize())
+        if track.has_audio and not track.buffering:
+            track.ready.set()
+
+    @staticmethod
+    def _clear_frames(track):
+        while not track.frames.empty():
+            try:
+                track.frames.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    def _fail_buffered_track(self, track, stage):
+        if track.done.is_set():
+            return
+        track.exit_code = 1
+        self._end_buffering(track)
+        track.ready.set()
+        track.done.set()
+        self._clear_frames(track)
+        logger.warning("[KookMusic] PCM buffer stage=%s", stage)
+        track.cleanup_task = asyncio.create_task(self._cleanup_track(track))
 
     @property
     def is_relay_running(self) -> bool:
@@ -370,12 +469,22 @@ class RelayFFmpegPlayer:
                 frame = silence
                 song_frame = False
                 if track and not track.done.is_set():
-                    try:
-                        frame = track.frames.get_nowait()
-                        song_frame = True
-                    except asyncio.QueueEmpty:
-                        if track.decoded:
-                            track.done.set()
+                    if (
+                        track.buffering and track.buffer_started_at is not None
+                        and loop.time() - track.buffer_started_at >= self.SOURCE_READY_TIMEOUT
+                    ):
+                        self._fail_buffered_track(track, "STALL_TIMEOUT")
+                    else:
+                        self._release_buffer_if_ready(track)
+                        if not track.buffering:
+                            try:
+                                frame = track.frames.get_nowait()
+                                song_frame = True
+                            except asyncio.QueueEmpty:
+                                if track.decoded:
+                                    track.done.set()
+                                elif track.controlled_buffering and track.ready.is_set():
+                                    self._begin_buffering(track, track.rebuffer_frames)
                 relay.stdin.write(frame)
                 await asyncio.wait_for(relay.stdin.drain(), timeout=1.0)
                 if song_frame:
@@ -394,9 +503,12 @@ class RelayFFmpegPlayer:
                 self._relay_failed = True
                 track = self._song
                 if track and not track.done.is_set():
-                    track.exit_code = 1
-                    track.ready.set()
-                    track.done.set()
+                    if track.controlled_buffering:
+                        self._fail_buffered_track(track, "RELAY_FAILED")
+                    else:
+                        track.exit_code = 1
+                        track.ready.set()
+                        track.done.set()
 
     async def play(
         self,
@@ -405,12 +517,23 @@ class RelayFFmpegPlayer:
         ssrc: int = 0,
         extra_headers: dict | None = None,
         start_seconds: float = 0.0,
+        startup_buffer_seconds: float = 0.0,
+        max_buffer_seconds: float = 0.5,
+        rebuffer_seconds: float = 0.0,
     ) -> bool:
         await self.stop()
         if not self.is_relay_running or not _source_exists(file_path):
             logger.error("[KookMusic] Invalid relay/source: %s", _source_label(file_path))
             return False
-        track = _PCMTrack()
+        limit, initial, refill, controlled = self._buffer_settings(
+            startup_buffer_seconds, max_buffer_seconds, rebuffer_seconds
+        )
+        track = _PCMTrack(
+            frames=asyncio.Queue(maxsize=limit), startup_frames=initial,
+            rebuffer_frames=refill, controlled_buffering=controlled,
+        )
+        if controlled:
+            self._begin_buffering(track, initial)
         self._song = track
         self._current_file = file_path
         cmd = [
@@ -426,14 +549,17 @@ class RelayFFmpegPlayer:
                 stderr=asyncio.subprocess.PIPE, limit=65536,
             )
             track.process = process
-            if self._song is not track:
+            if self._song is not track or track.done.is_set():
                 await self._terminate_process(process)
+                if self._song is track:
+                    await self.stop()
                 return False
             track.stderr_task = asyncio.create_task(self._read_song_stderr(process.stderr))
             track.decoder_task = asyncio.create_task(self._decode_song(track))
             await asyncio.wait_for(track.ready.wait(), self.SOURCE_READY_TIMEOUT)
             failed_or_empty = track.done.is_set() and (
-                not track.has_audio or track.exit_code != 0
+                not track.has_audio
+                or (track.exit_code != 0 and not (track.failed_eof and track.played_bytes > 0))
             )
             if self._song is not track or failed_or_empty or not self.is_relay_running:
                 if self._song is track:
@@ -460,19 +586,31 @@ class RelayFFmpegPlayer:
                     if exc.partial:
                         await track.frames.put(exc.partial.ljust(self.FRAME_BYTES, b"\0"))
                         track.has_audio = True
-                        track.ready.set()
+                        self._release_buffer_if_ready(track)
                     break
                 await track.frames.put(frame)
                 track.has_audio = True
-                track.ready.set()
+                self._release_buffer_if_ready(track)
             track.exit_code = await track.process.wait()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             track.exit_code = 1
-            logger.debug("[KookMusic] PCM decode failed: %s", _redact_signed_urls(str(exc)))
+            logger.debug("[KookMusic] PCM decode stage=FAILED error=%s", type(exc).__name__)
         finally:
             track.decoded = True
+            if (
+                track.controlled_buffering and track.exit_code not in (0, None)
+                and not track.done.is_set()
+            ):
+                # A failed upstream can still leave minutes of valid decoded PCM.
+                # Drain it before reporting failure so fresh+seek resumes afterward.
+                track.failed_eof = True
+                logger.warning(
+                    "[KookMusic] PCM buffer stage=%s",
+                    "DECODE_DRAIN" if track.has_audio else "DECODE_FAILED",
+                )
+            self._release_buffer_if_ready(track)
             track.ready.set()
             if not track.has_audio:
                 track.done.set()
@@ -484,14 +622,21 @@ class RelayFFmpegPlayer:
         if track is None:
             return
         track.exit_code = None
+        self._end_buffering(track)
         track.ready.set()
         track.done.set()
+        self._clear_frames(track)
         await self._finish_cleanup(self._cleanup_track(track))
 
     async def _cleanup_track(self, track):
+        if track.cleanup_task is not None and track.cleanup_task is not asyncio.current_task():
+            await track.cleanup_task
+            self._clear_frames(track)
+            return
         await self._cancel_task(track.decoder_task)
         await self._cancel_task(track.stderr_task)
         await self._terminate_process(track.process)
+        self._clear_frames(track)
 
     async def stop_relay(self):
         await self._finish_cleanup(self._cleanup_relay())
@@ -548,12 +693,47 @@ class RelayFFmpegPlayer:
         track = self._song
         if track is None:
             return False
+        if track.controlled_buffering:
+            try:
+                return await self._wait_buffered_track(track, timeout)
+            except asyncio.CancelledError:
+                if self._song is track:
+                    await self.stop()
+                raise
         try:
             await asyncio.wait_for(track.done.wait(), timeout)
         except asyncio.TimeoutError:
             if self._song is track:
                 await self.stop()
             return False
+        return track.exit_code == 0 and self.is_relay_running
+
+    async def _wait_buffered_track(self, track, timeout):
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        baseline = self._buffer_wall_time(track, started)
+        while not track.done.is_set():
+            now = loop.time()
+            stall_left = self.SOURCE_READY_TIMEOUT
+            if track.buffering and track.buffer_started_at is not None:
+                stall_left -= now - track.buffer_started_at
+                if stall_left <= 0:
+                    self._fail_buffered_track(track, "STALL_TIMEOUT")
+                    break
+            remaining = None
+            if timeout is not None:
+                buffering = self._buffer_wall_time(track, now) - baseline
+                remaining = timeout - (now - started - buffering)
+                if remaining <= 0:
+                    self._fail_buffered_track(track, "PLAYBACK_TIMEOUT")
+                    break
+            wait = min(0.1, stall_left, remaining if remaining is not None else 0.1)
+            try:
+                await asyncio.wait_for(track.done.wait(), max(0.001, wait))
+            except TimeoutError:
+                pass
+        if track.cleanup_task is not None or track.exit_code not in (0, None):
+            await self._finish_cleanup(self._cleanup_track(track))
         return track.exit_code == 0 and self.is_relay_running
 
     async def _read_relay_stderr(self, stderr_stream):

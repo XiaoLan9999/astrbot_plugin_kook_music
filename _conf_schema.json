@@ -116,6 +116,27 @@
         },
         "default": 30
     },
+    "stream_startup_buffer_seconds": {
+        "description": "远程音频开播预缓冲(秒)",
+        "hint": "仅 relay 远程流有效，默认先缓存 15 秒音频再播放；不是固定等待 15 秒，下载越快开播越快。缓冲阶段最多等待 30 秒；0 为收到音频立即播放。",
+        "type": "int",
+        "slider": {"min": 0, "max": 30, "step": 1},
+        "default": 15
+    },
+    "stream_max_buffer_seconds": {
+        "description": "远程音频最大前向缓存(秒)",
+        "hint": "仅 relay 远程流有效，默认提前缓存最多 120 秒，不下载整段长视频。使用内存 PCM 缓存，120 秒约 23 MB/频道，300 秒约 58 MB/频道。",
+        "type": "int",
+        "slider": {"min": 5, "max": 300, "step": 5},
+        "default": 120
+    },
+    "stream_rebuffer_seconds": {
+        "description": "远程音频断流恢复预缓冲(秒)",
+        "hint": "缓存耗尽后，先重新缓存默认 5 秒音频再继续，减少断续卡音；每次缓冲最多等待 30 秒，失败后按原逻辑刷新流地址并续播。0 为立即恢复。",
+        "type": "int",
+        "slider": {"min": 0, "max": 30, "step": 1},
+        "default": 5
+    },
     "max_queue_size": {
         "description": "最大播放队列长度",
         "hint": "每个服务器允许排队的最大歌曲数量",

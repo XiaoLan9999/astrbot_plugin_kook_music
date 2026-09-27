@@ -31,6 +31,7 @@ from .kook_voice.ffmpeg_installer import check_and_install_ffmpeg
 from .music.downloader import MusicDownloader
 from .music.model import Song
 from .music.searcher import MusicSearcher
+from .music.link_router import resolve_music_link
 from .music.bilibili import BilibiliCollection, BilibiliExtractor
 from .music.playlist_import import PlaylistImporter
 from .playlist_range import looks_like_playlist_range, validate_playlist_range
@@ -92,6 +93,21 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             0,
             1440,
         )
+        self.stream_max_buffer_seconds = self._parse_int_range(
+            self.config.get("stream_max_buffer_seconds", 120), 120, 5, 300
+        )
+        self.stream_startup_buffer_seconds = min(
+            self.stream_max_buffer_seconds,
+            self._parse_int_range(
+                self.config.get("stream_startup_buffer_seconds", 15), 15, 0, 30
+            ),
+        )
+        self.stream_rebuffer_seconds = min(
+            self.stream_max_buffer_seconds,
+            self._parse_int_range(
+                self.config.get("stream_rebuffer_seconds", 5), 5, 0, 30
+            ),
+        )
 
         # 核心组件
         self.data_dir = Path("data/plugin_data/astrbot_plugin_kook_music")
@@ -124,6 +140,9 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             streaming_mode=self.streaming_mode,
             max_queue_size=self.max_queue_size,
             prefetch_next=self.prefetch_next,
+            stream_startup_buffer_seconds=self.stream_startup_buffer_seconds,
+            stream_max_buffer_seconds=self.stream_max_buffer_seconds,
+            stream_rebuffer_seconds=self.stream_rebuffer_seconds,
         )
 
         self.custom_ffmpeg_path = self.config.get("custom_ffmpeg_path", "").strip()
@@ -596,7 +615,7 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
         # 从完整消息中提取命令后的内容（保留空格）
         raw_text = event.message_str.strip()
         # 移除命令前缀 "点歌"
-        for prefix in ("点歌", "/点歌"):
+        for prefix in ("#点歌", "/点歌", "点歌"):
             if raw_text.startswith(prefix):
                 raw_text = raw_text[len(prefix):].strip()
                 break
@@ -633,9 +652,26 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
 
         channel_id = self._get_channel_id(event)
 
+        # URL inputs must never silently become keyword searches.
+        link = await resolve_music_link(raw_text)
+        if link.kind in {"invalid", "unsupported"}:
+            yield event.plain_result(f"❌ {link.reason}")
+            return
+        if link.kind == "playlist":
+            command = "播放" if link.platform == "bilibili" else "导入歌单"
+            yield event.plain_result(
+                f"🔗 检测到歌单/收藏夹链接，请改用 #{command} <原链接>。"
+            )
+            return
+        if link.kind == "video":
+            async with aclosing(self._on_play_video_request(event, link.url)) as results:
+                async for result in results:
+                    yield result
+            return
+
         # ---- 网易云单曲 / 电台节目链接：直接解析播放，不进入搜索流程 ----
-        direct_type, direct_id = PlaylistImporter.parse_direct_song_input(raw_text)
-        if direct_id:
+        direct_type, direct_id = link.resource_type, link.id
+        if link.kind == "song" and link.platform == "netease":
             msg_ids: list[str] = []
             type_label = "电台节目" if direct_type == "program" else "网易云单曲"
             if self._kook_token and channel_id:
@@ -669,8 +705,8 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             return
 
         # ---- QQ音乐 / 酷狗单曲链接：按平台稳定 ID 解析 ----
-        direct_platform = MusicSearcher.detect_direct_platform(raw_text)
-        if direct_platform:
+        direct_platform = link.platform
+        if link.kind == "song" and direct_platform in {"qq", "kugou"}:
             msg_ids: list[str] = []
             platform_label = "QQ音乐" if direct_platform == "qq" else "酷狗音乐"
             if self._kook_token and channel_id:
@@ -684,7 +720,10 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             else:
                 yield event.plain_result(f"🔗 正在解析{platform_label}单曲链接...")
 
-            song = await self.searcher.fetch_direct_song(raw_text)
+            if link.id:
+                song = await self.searcher.fetch_song_by_id(direct_platform, link.id)
+            else:
+                song = await self.searcher.fetch_direct_song(link.url)
             await self._delete_messages(msg_ids)
             if not song:
                 yield event.plain_result(
@@ -976,7 +1015,9 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             async for result in results:
                 yield result
 
-    async def _on_play_video_request(self, event: AstrMessageEvent):
+    async def _on_play_video_request(
+        self, event: AstrMessageEvent, resolved_input: str | None = None
+    ):
         """播放 <关键词/BV号/视频或收藏夹链接> — 播放视频音频"""
         if not self._is_kook(event):
             return
@@ -987,7 +1028,7 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
                 yield event.plain_result("❌ 未找到 KOOK Token")
                 return
 
-        raw_text = event.message_str.strip()
+        raw_text = resolved_input if resolved_input is not None else event.message_str.strip()
         for prefix in ("#播放", "/播放", "播放"):
             if raw_text.startswith(prefix):
                 raw_text = raw_text[len(prefix):].strip()
@@ -1114,10 +1155,29 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
                     old_entry[1].cancel()
                 _playlist_import_requests[interaction_key] = request_marker
 
-        # 官方链接自动识别平台；裸数字保持兼容，仍默认网易云。
-        import_type, target_id = await self.playlist_importer.resolve_playlist_input(
-            raw_text
-        )
+        # Classify official URLs before the legacy numeric-ID parser.
+        link = await resolve_music_link(raw_text)
+        if link.kind != "none":
+            if link.kind == "playlist" and link.platform != "bilibili":
+                import_type = (
+                    "djradio" if link.resource_type == "djradio" else link.platform
+                )
+                target_id = link.id
+            else:
+                self._finish_playlist_import_request(interaction_key, request_marker)
+                if link.kind == "song":
+                    message = "检测到单曲链接，请改用 #点歌 <原链接>。"
+                elif link.platform == "bilibili" and link.kind in {"video", "playlist"}:
+                    message = "B站视频/收藏夹请使用 #播放 <原链接>。"
+                else:
+                    message = link.reason
+                yield event.plain_result(f"❌ {message}")
+                return
+        else:
+            # Bare numeric IDs retain their existing platform-prefix syntax.
+            import_type, target_id = await self.playlist_importer.resolve_playlist_input(
+                raw_text
+            )
         if not target_id:
             self._finish_playlist_import_request(interaction_key, request_marker)
             yield event.plain_result(

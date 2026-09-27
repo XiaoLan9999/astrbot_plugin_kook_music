@@ -314,7 +314,7 @@ class BilibiliCollectionTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    async def test_prepare_audio_falls_back_to_download_when_stream_resolution_fails(self):
+    async def test_prepare_audio_does_not_download_when_long_stream_resolution_fails(self):
         extractor = BilibiliExtractor()
         song = Song(
             id=BVID_ONE,
@@ -325,17 +325,14 @@ class BilibiliCollectionTests(unittest.IsolatedAsyncioTestCase):
         )
         extractor.resolve_audio_stream = AsyncMock(return_value=song)
 
-        async def download(prepared_song, _cache_dir):
-            prepared_song.file_path = "cache/fallback.m4a"
-            return prepared_song
-
-        extractor.download_audio = AsyncMock(side_effect=download)
+        extractor.download_audio = AsyncMock()
 
         result = await extractor.prepare_audio(song, Path("cache"), 30)
 
-        self.assertEqual(result.playback_source, "cache/fallback.m4a")
+        self.assertEqual(result.playback_source, "")
+        self.assertIn("不会自动完整下载", result.unplayable_reason)
         extractor.resolve_audio_stream.assert_awaited_once_with(song)
-        extractor.download_audio.assert_awaited_once_with(song, Path("cache"))
+        extractor.download_audio.assert_not_awaited()
 
     async def test_official_search_api_falls_back_before_yt_dlp_search(self):
         extractor = BilibiliExtractor()

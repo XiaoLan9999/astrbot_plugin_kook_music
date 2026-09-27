@@ -44,6 +44,7 @@ class BilibiliCollection:
 class BilibiliExtractor:
     """B站视频音频提取器（使用 yt-dlp）"""
 
+    AUDIO_FORMAT = "ba[ext=m4a]/ba"
     VIEW_API_URL = "https://api.bilibili.com/x/web-interface/view"
     SEARCH_API_URL = "https://api.bilibili.com/x/web-interface/search/type"
     SEARCH_PAGE_URL = "https://search.bilibili.com/all"
@@ -991,16 +992,41 @@ class BilibiliExtractor:
             song = await self.resolve_audio_stream(song)
             if song.stream_url:
                 return song
-            logger.warning(
-                f"[KookMusic] B站流地址解析失败，回退到完整下载: {song.name}"
+            song.unplayable_reason = (
+                "暂时无法取得 B站纯音频流，请稍后重试；"
+                "为避免长时间等待和大量下载，不会自动完整下载长视频"
             )
+            logger.warning(
+                "[KookMusic] B站长视频音频流解析失败，已停止准备，未回退完整下载"
+            )
+            return song
         return await self.download_audio(song, cache_dir)
+
+    @staticmethod
+    def _is_audio_only_media(info: object) -> bool:
+        if not isinstance(info, dict):
+            return False
+        media = [info]
+        for key in ("requested_formats", "requested_downloads"):
+            entries = info.get(key)
+            if isinstance(entries, list):
+                media.extend(entry for entry in entries if isinstance(entry, dict))
+        for entry in media:
+            # Older extractors may omit codec metadata; explicit video is never valid.
+            vcodec = str(entry.get("vcodec") or "").strip().lower()
+            acodec = str(entry.get("acodec") or "").strip().lower()
+            if (vcodec and vcodec != "none") or acodec == "none":
+                return False
+        return True
 
     async def resolve_audio_stream(self, song: Song) -> Song:
         """在歌曲即将播放时解析一次短期有效的 B站音频 CDN 地址。"""
         url = self._video_url_from_song(song)
         song.stream_url = ""
+        song.extra_headers = {}
+        song.unplayable_reason = ""
         if not url:
+            song.unplayable_reason = "B站视频 ID 或分P无效，请使用有效的视频链接"
             logger.error(f"[KookMusic] B站流解析缺少有效 BVID 或分P: {song.id}")
             return song
         song.audio_url = url
@@ -1011,8 +1037,11 @@ class BilibiliExtractor:
                 payload = await asyncio.to_thread(self._yt_resolve_audio_stream, url)
             except Exception as e:
                 logger.warning(
-                    f"[KookMusic] B站流地址解析异常（第 {attempt + 1}/2 次）: {e}"
+                    f"[KookMusic] B站流地址解析异常（第 {attempt + 1}/2 次）: "
+                    f"{type(e).__name__}"
                 )
+                payload = {}
+            if not self._is_audio_only_media(payload):
                 payload = {}
             stream_url = self._safe_stream_url(payload.get("url"))
             if stream_url:
@@ -1043,7 +1072,7 @@ class BilibiliExtractor:
             if attempt == 0:
                 await asyncio.sleep(0.5)
 
-        song.extra_headers = {}
+        song.unplayable_reason = "暂时无法取得可用的 B站纯音频流，请稍后重试"
         logger.error(f"[KookMusic] 无法获取安全的 B站 HTTPS 音频流: {song.name}")
         return song
 
@@ -1051,13 +1080,13 @@ class BilibiliExtractor:
         """同步调用 yt-dlp 选择一条纯音频流，不下载媒体文件。"""
         opts = self._base_ydl_opts()
         opts.update({
-            "format": "ba[ext=m4a]/ba/b",
+            "format": self.AUDIO_FORMAT,
             "skip_download": True,
             "noplaylist": True,
         })
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-        if not isinstance(info, dict):
+        if not self._is_audio_only_media(info):
             return {}
         return {
             "url": info.get("url", ""),
@@ -1067,6 +1096,8 @@ class BilibiliExtractor:
             "channel": info.get("channel", ""),
             "duration": info.get("duration", 0),
             "thumbnail": info.get("thumbnail", ""),
+            "vcodec": info.get("vcodec"),
+            "acodec": info.get("acodec"),
         }
 
     async def download_audio(self, song: Song, cache_dir: Path) -> Song:
@@ -1097,6 +1128,7 @@ class BilibiliExtractor:
             result_path = await asyncio.shield(download_task)
             if result_path and Path(result_path).exists():
                 song.file_path = result_path
+                song.unplayable_reason = ""
                 logger.info(
                     f"[KookMusic] B站音频下载完成: {song.name} -> "
                     f"{Path(result_path).name}"
@@ -1136,13 +1168,16 @@ class BilibiliExtractor:
         """同步调用 yt-dlp 下载音频"""
         opts = self._base_ydl_opts()
         opts.update({
-            "format": "ba[ext=m4a]/ba/b",  # 优先 m4a 音频，回退到最佳音频
+            "format": self.AUDIO_FORMAT,
             "outtmpl": output_base + ".%(ext)s",
             "noplaylist": True,
         })
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
+            if not self._is_audio_only_media(info):
+                self._cleanup_cancelled_download(output_base)
+                return ""
 
             # 从 yt-dlp 返回中获取实际文件路径
             if info and "requested_downloads" in info:
