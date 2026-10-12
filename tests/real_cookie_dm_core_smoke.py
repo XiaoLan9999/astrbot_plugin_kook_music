@@ -61,7 +61,7 @@ async def smoke():
             raise AssertionError(label)
         checks += 1
 
-    check(VERSION == "4.28.1", "smoke uses the intended real AstrBot version")
+    check(VERSION in {"4.28.1", "4.28.2"}, "smoke uses a supported real AstrBot version")
     check(Metric._is_disabled(), "metrics disabled before importing core")
     queue = asyncio.Queue()
     adapters = [
