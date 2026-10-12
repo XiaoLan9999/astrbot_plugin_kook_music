@@ -7,6 +7,7 @@ endpoints. No public music resolver is used by this module.
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -390,6 +391,59 @@ class QQBackend:
             isinstance(error, AuthError) and error.kind == "expired"
         )
 
+    @staticmethod
+    def _has_refresh_material(credential):
+        return isinstance(credential, dict) and all(
+            isinstance(credential.get(name), str) and credential[name].strip()
+            for name in ("refresh_key", "refresh_token")
+        )
+
+    def refresh_due(self, credential, *, now, lead_seconds=3600) -> bool | None:
+        if not self._has_refresh_material(credential):
+            return False
+        refresh_at = self.next_refresh_at(credential, now=now, lead_seconds=lead_seconds)
+        return None if refresh_at is None else float(now) >= refresh_at
+
+    def next_refresh_at(self, credential, *, now, lead_seconds=3600) -> float | None:
+        """Use the music-key lifetime, independently of the OAuth token lifetime."""
+        if not self._has_refresh_material(credential):
+            return None
+
+        def number(value):
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                return None
+            if isinstance(value, str) and len(value) > 128:
+                return None
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return value if math.isfinite(value) and value >= 0 else None
+
+        def aliased(snake, camel):
+            values = [number(credential[key]) for key in (snake, camel) if key in credential]
+            if not values or any(value is None for value in values):
+                return None
+            return values[0] if all(value == values[0] for value in values) else None
+
+        creation = aliased("musickey_create_time", "musickeyCreateTime")
+        lifetime = aliased("key_expires_in", "keyExpiresIn")
+        current, lead = number(now), number(lead_seconds)
+        if (
+            creation is None
+            or creation <= 0
+            or lifetime is None
+            or lifetime <= 0
+            or current is None
+            or lead is None
+        ):
+            return None
+        deadline = creation + lifetime
+        if not math.isfinite(deadline):
+            return None
+        # Short-lived keys must not become due immediately after every refresh.
+        return deadline - min(lead, lifetime / 4)
+
     async def begin_login(self, method: str) -> LoginChallenge:
         if method not in {"qq", "wechat"}:
             raise AuthError("invalid_method", "Choose QQ or WeChat login")
@@ -705,15 +759,32 @@ class QQBackend:
         try:
             client = self._get_client()
             target = self._credential(credential)
-            if not target.refresh_key or not target.refresh_token:
-                return None
-            result = await self._call(client.login.refresh_credential(target))
-            return self._credential(result.model_dump()).model_dump(mode="json")
         except Exception as error:
             if self._expired(error):
                 return None
             raise AuthError(
                 "transient", "QQ Music credential refresh is temporarily unavailable"
+            ) from None
+        if not target.refresh_key or not target.refresh_token:
+            return None
+        try:
+            result = await self._call(client.login.refresh_credential(target))
+        except Exception as error:
+            if self._expired(error):
+                return None
+            raise AuthError(
+                "transient", "QQ Music credential refresh is temporarily unavailable"
+            ) from None
+        try:
+            refreshed = self._credential(result.model_dump())
+            if refreshed.musicid != target.musicid or (
+                target.login_type in {1, 2} and refreshed.login_type != target.login_type
+            ):
+                raise ValueError
+            return refreshed.model_dump(mode="json")
+        except Exception:
+            raise AuthError(
+                "transient", "QQ Music returned an invalid credential refresh response"
             ) from None
 
     async def resolve_audio(self, song, credential: dict) -> AudioResult:

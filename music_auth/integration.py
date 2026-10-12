@@ -95,7 +95,10 @@ class MusicAuthMixin:
             logger.info("[KookMusic] Manual cookie rejected (%s)", exc.code)
             return False, f"{exc} 阶段：{exc.code}。原账号未更改，请重新开启接收窗口。"
         except ValueError:
-            return False, "网易云登录态格式无效（COOKIE_FORMAT），原账号未更改。请完整复制 Header String / JSON / Netscape，再重新开启窗口。"
+            return (
+                False,
+                "网易云登录态格式无效（COOKIE_FORMAT），原账号未更改。请完整复制 Header String / JSON / Netscape，再重新开启窗口。",
+            )
         manager = self._music_auth
         result = await manager.import_credentials(
             "netease",
@@ -171,6 +174,12 @@ class MusicAuthMixin:
                     admin_ids=set(self._music_auth_admin_ids),
                     check_interval=_number(
                         self.config.get("music_auth_check_interval"), 1800, 300, 86400
+                    ),
+                    refresh_lead_seconds=_number(
+                        self.config.get("music_auth_refresh_lead_seconds"),
+                        3600,
+                        0,
+                        86400,
                     ),
                     notice_cooldown=_number(
                         self.config.get("music_auth_notice_cooldown"),

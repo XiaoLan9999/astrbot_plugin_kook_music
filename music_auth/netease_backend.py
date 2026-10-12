@@ -475,9 +475,16 @@ class NeteaseBackend:
                 "/weapi/login/token/refresh", {}, cookies
             )
         except AuthError:
+            raise AuthError(
+                "transient", "NetEase credential refresh is temporarily unavailable"
+            ) from None
+        code = body.get("code")
+        if type(code) is int and code == 301:
             return None
-        if body.get("code") != 200:
-            return None
+        if type(code) is not int or code != 200:
+            raise AuthError(
+                "transient", "NetEase credential refresh is temporarily unavailable"
+            ) from None
         cookies.update(received)
         return {"cookies": cookies}
 

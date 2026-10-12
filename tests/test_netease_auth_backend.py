@@ -366,10 +366,32 @@ class CredentialAudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed["cookies"]["MUSIC_U"], "renewed")
         self.assertEqual(old["cookies"], COOKIE)
 
-    async def test_refresh_timeout_returns_none(self):
-        self.assertIsNone(
+    async def test_refresh_timeout_remains_transient(self):
+        with self.assertRaises(AuthError) as error:
             await self.call("refresh_credentials", asyncio.TimeoutError("secret"))
+        self.assertEqual(error.exception.kind, "transient")
+        self.assertNotIn("secret", str(error.exception))
+
+    async def test_refresh_explicit_login_rejection_returns_none(self):
+        self.assertIsNone(
+            await self.call("refresh_credentials", {"code": 301, "message": "secret"})
         )
+
+    async def test_refresh_unknown_or_verification_code_remains_transient(self):
+        for code in (502, 8821, 429, None, "200", True):
+            with self.subTest(code=code):
+                with self.assertRaises(AuthError) as error:
+                    await self.call(
+                        "refresh_credentials", {"code": code, "message": "secret"}
+                    )
+                self.assertEqual(error.exception.kind, "transient")
+                self.assertNotIn("secret", str(error.exception))
+
+    async def test_refresh_auth_error_does_not_discard_credentials(self):
+        with self.assertRaises(AuthError) as error:
+            await self.call("refresh_credentials", AuthError("transient", "secret"))
+        self.assertEqual(error.exception.kind, "transient")
+        self.assertNotIn("secret", str(error.exception))
 
     async def resolve(self, response, song=SONG):
         transport = FakeTransport(response)

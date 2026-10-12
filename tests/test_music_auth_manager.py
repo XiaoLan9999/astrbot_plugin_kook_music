@@ -503,13 +503,16 @@ class AuthManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager._state["accounts"]["qq"]["state"], "valid")
         self.notify.assert_not_called()
 
-    async def test_bad_refreshed_credential_never_replaces_saved_account(self):
+    async def test_unknown_refreshed_credential_is_preserved_pending_verification(self):
         self.seed()
         self.qq.check_credentials.side_effect = ["expired", "unknown"]
         self.qq.refresh_credentials.return_value = NEW
         await self.manager._check_provider("qq")
         self.assertEqual(self.manager._state["accounts"]["qq"]["credential"], OLD)
-        self.assertEqual(self.manager._state["accounts"]["qq"]["state"], "expired")
+        self.assertEqual(self.manager._state["accounts"]["qq"]["state"], "unknown")
+        self.assertEqual(
+            self.manager._state["accounts"]["qq"]["pending_credential"], NEW
+        )
 
     async def test_check_while_login_is_pending_cannot_overwrite_account(self):
         self.seed()
@@ -722,18 +725,21 @@ class AuthManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.cancel_login("qq", "bot", "admin")
         self.assertEqual(self.manager._state["accounts"]["qq"]["credential"], OLD)
 
-    async def test_refresh_retry_expired_is_persisted_and_notified_once(self):
+    async def test_refreshed_audio_expiry_is_deferred_without_revoking_refresh_grant(
+        self,
+    ):
         self.seed()
         self.seed("netease")
         await self.manager.start("bot")
         self.qq.resolve_audio.return_value = AudioResult("expired")
         self.qq.refresh_credentials.return_value = NEW
         result = await self.manager.resolve_audio(SimpleNamespace(platform="qq"))
-        self.assertEqual(result.status, "expired")
-        self.assertEqual(self.manager._state["accounts"]["qq"]["state"], "expired")
+        self.assertEqual(result.status, "transient")
+        self.assertEqual(self.manager._state["accounts"]["qq"]["state"], "unknown")
         self.assertEqual(self.manager._state["accounts"]["qq"]["credential"], NEW)
         self.qq.refresh_credentials.assert_awaited_once()
-        self.assertEqual(self.notify.await_count, 2)
+        self.assertEqual(self.notify.await_count, 0)
+        self.assertFalse(self.manager._state["accounts"]["qq"]["refresh_rejected"])
 
     async def test_old_expired_result_does_not_refresh_newly_refreshed_credentials(
         self,

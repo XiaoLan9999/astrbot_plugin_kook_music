@@ -108,6 +108,34 @@ class CredentialStore:
                 raise CredentialStoreError("Account status is malformed.")
             if not isinstance(account.get("refresh_attempted", False), bool):
                 raise CredentialStoreError("Account refresh status is malformed.")
+            if "pending_credential" in account and (
+                not isinstance(account["pending_credential"], dict)
+                or not account["pending_credential"]
+            ):
+                raise CredentialStoreError("Pending account credential is malformed.")
+            if not isinstance(account.get("refresh_rejected", False), bool):
+                raise CredentialStoreError("Account refresh status is malformed.")
+            if not isinstance(account.get("refresh_pending", False), bool):
+                raise CredentialStoreError("Account refresh status is malformed.")
+            if "renewal_version" in account and (
+                type(account["renewal_version"]) is not int
+                or account["renewal_version"] != 1
+            ):
+                raise CredentialStoreError("Account renewal format is unsupported.")
+            failures = account.get("refresh_failures", 0)
+            if type(failures) is not int or not 0 <= failures <= 20:
+                raise CredentialStoreError("Account refresh count is malformed.")
+            for field in ("refresh_retry_at", "last_refresh_at"):
+                value = account.get(field, 0)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not 0 <= value <= 1e12
+                    or not math.isfinite(value)
+                ):
+                    raise CredentialStoreError(
+                        "Account renewal timestamp is malformed."
+                    )
         for key, value in notices.items():
             if (
                 not isinstance(key, str)

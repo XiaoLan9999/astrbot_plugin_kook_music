@@ -54,6 +54,10 @@ class _PendingLogin:
 
 class AuthManager:
     LABELS = {"qq": "QQ音乐", "netease": "网易云音乐"}
+    REFRESH_RETRY_BASE = 60
+    REFRESH_RETRY_MAX = 3600
+    REFRESH_MAINTENANCE_INTERVAL = 43200
+    REFRESH_MIN_INTERVAL = 300
 
     def __init__(
         self,
@@ -66,6 +70,7 @@ class AuthManager:
         login_timeout=180,
         poll_interval=2,
         operation_timeout=30,
+        refresh_lead_seconds=3600,
     ):
         self.store = CredentialStore(credentials_dir)
         self._state = self.store.load()
@@ -79,12 +84,14 @@ class AuthManager:
         self.login_timeout = max(float(login_timeout), 0.01)
         self.poll_interval = max(float(poll_interval), 0.001)
         self.operation_timeout = max(float(operation_timeout), 0.01)
+        self.refresh_lead_seconds = max(0, min(float(refresh_lead_seconds), 86400))
         self._lock = asyncio.Lock()
         self._notice_lock = asyncio.Lock()
         self._check_locks = {provider: asyncio.Lock() for provider in backends}
         self._pending = {}
         self._login_tasks = set()
         self._cleanup_tasks = set()
+        self._renewal_wakeup = asyncio.Event()
         self._generation = {provider: 0 for provider in backends}
         self._bots = set()
         self._loop_task = None
@@ -118,6 +125,7 @@ class AuthManager:
             self._storage_failed = True
             raise
         self._state = state
+        self._renewal_wakeup.set()
 
     async def _send(self, bot_id, user_id, text, qr_bytes=None):
         try:
@@ -153,6 +161,7 @@ class AuthManager:
             )
             self._login_tasks.add(pending.task)
             pending.task.add_done_callback(self._login_tasks.discard)
+            self._renewal_wakeup.set()
         return (
             True,
             "已启动登录流程，二维码仅发送到本次管理员私聊；请在有效期内扫码确认。",
@@ -215,6 +224,8 @@ class AuthManager:
                     "credential": copy.deepcopy(credential),
                     "state": "valid",
                     "refresh_attempted": False,
+                    "last_refresh_at": time.time(),
+                    "renewal_version": 1,
                 }
                 stage = "SAVE_FAILED"
                 self._save(state)
@@ -383,6 +394,8 @@ class AuthManager:
                         "credential": credential,
                         "state": "valid",
                         "refresh_attempted": False,
+                        "last_refresh_at": time.time(),
+                        "renewal_version": 1,
                     }
                     stage = "LOGIN_SAVE"
                     self._save(state)
@@ -462,6 +475,7 @@ class AuthManager:
             )
             if self._pending.get(provider) is pending:
                 self._pending.pop(provider, None)
+                self._renewal_wakeup.set()
             return current
 
     async def _cleanup_login(self, backend, pending):
@@ -493,6 +507,7 @@ class AuthManager:
                 return False, "只能由同一机器人私聊中的登录发起者取消。"
             self._generation[provider] += 1
             self._pending.pop(provider, None)
+            self._renewal_wakeup.set()
             pending.task.cancel()
         await asyncio.gather(pending.task, return_exceptions=True)
         return True, "已取消该平台登录，原账号未更改。"
@@ -563,8 +578,42 @@ class AuthManager:
     async def _check_loop(self):
         try:
             while not self._closed and not self._storage_failed:
-                await asyncio.sleep(self.check_interval)
-                await self.check_accounts()
+                self._renewal_wakeup.clear()
+                delay = self.check_interval
+                now = time.time()
+                for provider, record in self._state["accounts"].items():
+                    if provider in self._pending or record.get(
+                        "refresh_rejected", False
+                    ):
+                        continue
+                    retry_at = record.get("refresh_retry_at", 0)
+                    if retry_at > 0:
+                        delay = min(delay, max(0.01, retry_at - now))
+                        continue
+                    if provider == "qq":
+                        policy = getattr(
+                            self.backends.get(provider), "next_refresh_at", None
+                        )
+                        if callable(policy):
+                            try:
+                                due_at = policy(
+                                    copy.deepcopy(record["credential"]),
+                                    now=now,
+                                    lead_seconds=self.refresh_lead_seconds,
+                                )
+                            except Exception:
+                                due_at = None
+                            if due_at is not None:
+                                due_at = max(
+                                    due_at,
+                                    record.get("last_refresh_at", now)
+                                    + self.REFRESH_MIN_INTERVAL,
+                                )
+                                delay = min(delay, max(0.01, due_at - now))
+                try:
+                    await asyncio.wait_for(self._renewal_wakeup.wait(), delay)
+                except TimeoutError:
+                    await self.check_accounts()
         except asyncio.CancelledError:
             raise
 
@@ -592,6 +641,131 @@ class AuthManager:
             if log_manual:
                 logger.warning("[KookMusicAuth] manual credential check: CHECK_ERROR")
             return "unknown"
+
+    def _refresh_due(self, provider, backend, record, now):
+        policy = getattr(backend, "refresh_due", None)
+        if provider != "qq" or not callable(policy):
+            return False
+        if now - record.get("last_refresh_at", 0) < self.REFRESH_MIN_INTERVAL:
+            return False
+        try:
+            due = policy(
+                copy.deepcopy(record["credential"]),
+                now=now,
+                lead_seconds=self.refresh_lead_seconds,
+            )
+        except Exception:
+            return False
+        if due is None:
+            return (
+                now - record.get("last_refresh_at", now)
+                >= self.REFRESH_MAINTENANCE_INTERVAL
+            )
+        return due is True
+
+    def _defer_refresh(self, record, *, keep_valid=False, retry_refresh=True):
+        updated = copy.deepcopy(record)
+        failures = min(record.get("refresh_failures", 0) + 1, 20)
+        delay = min(
+            self.REFRESH_RETRY_BASE * 2 ** (failures - 1), self.REFRESH_RETRY_MAX
+        )
+        updated.update(
+            state="valid" if keep_valid else "unknown",
+            refresh_attempted=False,
+            refresh_rejected=record.get("refresh_rejected", False)
+            if not retry_refresh
+            else False,
+            refresh_pending=retry_refresh,
+            refresh_failures=failures,
+            refresh_retry_at=time.time() + delay,
+            renewal_version=1,
+        )
+        logger.warning("[MusicAuth] renewal stage=RETRY_WAIT delay_seconds=%s", delay)
+        return updated
+
+    @staticmethod
+    def _renewal_success(credential):
+        return {
+            "credential": copy.deepcopy(credential),
+            "state": "valid",
+            "refresh_attempted": False,
+            "refresh_rejected": False,
+            "refresh_pending": False,
+            "refresh_failures": 0,
+            "refresh_retry_at": 0,
+            "last_refresh_at": time.time(),
+            "renewal_version": 1,
+        }
+
+    async def _commit_account(self, provider, generation, expected, updated):
+        async with self._lock:
+            if (
+                self._closed
+                or self._storage_failed
+                or self._generation[provider] != generation
+                or provider in self._pending
+                or self._state["accounts"].get(provider) != expected
+            ):
+                return False
+            if updated != expected:
+                state = copy.deepcopy(self._state)
+                state["accounts"][provider] = updated
+                self._save(state)
+            return True
+
+    async def _rotate_credentials(self, provider, backend, record):
+        async def rotate_and_preserve():
+            credential = record.get("pending_credential") or record["credential"]
+            try:
+                refreshed = await asyncio.wait_for(
+                    backend.refresh_credentials(copy.deepcopy(credential)),
+                    self.operation_timeout,
+                )
+            except AuthError as error:
+                return (
+                    "rejected" if error.kind in {"expired", "rejected"} else "transient"
+                ), None
+            except Exception:
+                return "transient", None
+            if refreshed is None:
+                return "rejected", None
+            if not isinstance(refreshed, dict) or not refreshed:
+                return "transient", None
+            updated = copy.deepcopy(record)
+            updated.update(
+                pending_credential=copy.deepcopy(refreshed),
+                state="unknown",
+                refresh_attempted=False,
+                refresh_rejected=False,
+                refresh_retry_at=0,
+                renewal_version=1,
+            )
+            async with self._lock:
+                # Starting/cancelling login or closing must not lose rotated tokens.
+                # Logout or an account replacement deliberately invalidates this snapshot.
+                if (
+                    self._storage_failed
+                    or self._state["accounts"].get(provider) != record
+                ):
+                    return "stale", None
+                state = copy.deepcopy(self._state)
+                state["accounts"][provider] = updated
+                self._save(state)
+            return "rotated", updated
+
+        task = asyncio.create_task(rotate_and_preserve())
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+        interrupted = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                interrupted = True
+        result = task.result()
+        if interrupted:
+            raise asyncio.CancelledError
+        return result
 
     async def _check_provider(
         self,
@@ -621,50 +795,101 @@ class AuthManager:
             if not record:
                 await self._notice(provider, "missing")
                 return False
+            if record.get("refresh_rejected", False) and record["state"] == "expired":
+                await self._notice(provider, "expired")
+                return False
             backend = self.backends[provider]
-            validity = (
-                "expired"
-                if force_expired
-                else await self._backend_check(backend, record["credential"])
-            )
+            if record.get("refresh_retry_at", 0) > time.time():
+                return record["state"] == "valid" and not force_expired
+
+            candidate = record.get("pending_credential")
+            if candidate:
+                validity = await self._backend_check(backend, candidate)
+                if validity == "valid":
+                    updated = self._renewal_success(candidate)
+                elif validity == "unknown":
+                    updated = self._defer_refresh(record)
+                else:
+                    updated = copy.deepcopy(record)
+                if validity != "expired":
+                    if not await self._commit_account(
+                        provider, generation, record, updated
+                    ):
+                        return False
+                    return updated["state"] == "valid"
+            else:
+                validity = (
+                    "expired"
+                    if force_expired
+                    else await self._backend_check(backend, record["credential"])
+                )
             if validity == "unknown":
+                updated = self._defer_refresh(
+                    record,
+                    keep_valid=record["state"] == "valid",
+                    retry_refresh=False,
+                )
+                await self._commit_account(provider, generation, record, updated)
                 return False
             updated = copy.deepcopy(record)
             updated["state"] = validity
+            now = time.time()
+            updated.setdefault("last_refresh_at", now)
+            updated["renewal_version"] = 1
+            retrying = record.get(
+                "refresh_pending", record.get("refresh_failures", 0) > 0
+            )
+            due = self._refresh_due(provider, backend, record, now)
             if validity == "valid":
                 updated["refresh_attempted"] = False
-            elif not record.get("refresh_attempted", False):
-                updated["refresh_attempted"] = True
-                try:
-                    refreshed = await asyncio.wait_for(
-                        backend.refresh_credentials(
-                            copy.deepcopy(record["credential"])
-                        ),
-                        self.operation_timeout,
-                    )
-                except Exception:
-                    refreshed = None
-                if (
-                    isinstance(refreshed, dict)
-                    and refreshed
-                    and await self._backend_check(backend, refreshed) == "valid"
-                ):
-                    updated = {
-                        "credential": copy.deepcopy(refreshed),
-                        "state": "valid",
-                        "refresh_attempted": False,
-                    }
-            async with self._lock:
-                if (
-                    self._closed
-                    or self._storage_failed
-                    or self._generation[provider] != generation
-                ):
+            if not record.get("refresh_rejected", False) and (
+                validity == "expired" or due or retrying
+            ):
+                outcome, preserved = await self._rotate_credentials(
+                    provider, backend, record
+                )
+                if outcome == "stale":
                     return False
-                if updated != record:
-                    state = copy.deepcopy(self._state)
-                    state["accounts"][provider] = updated
-                    self._save(state)
+                if outcome == "rotated":
+                    record = preserved
+                    async with self._lock:
+                        if (
+                            self._closed
+                            or self._storage_failed
+                            or provider in self._pending
+                            or self._generation[provider] != generation
+                        ):
+                            return False
+                    refreshed = record["pending_credential"]
+                    validity = await self._backend_check(backend, refreshed)
+                    if validity == "valid":
+                        updated = self._renewal_success(refreshed)
+                    elif validity == "unknown":
+                        updated = self._defer_refresh(record)
+                    else:
+                        # An access key expiring does not revoke its refresh token.
+                        updated = self._defer_refresh(record)
+                elif outcome == "rejected":
+                    keep_valid = validity == "valid" and not candidate
+                    updated.update(
+                        state="valid" if keep_valid else "expired",
+                        refresh_attempted=True,
+                        refresh_rejected=True,
+                        refresh_pending=False,
+                        refresh_retry_at=0,
+                    )
+                else:
+                    updated = self._defer_refresh(
+                        updated, keep_valid=validity == "valid" and not candidate
+                    )
+            elif validity == "valid":
+                updated["refresh_retry_at"] = 0
+                updated["refresh_failures"] = 0
+                updated["refresh_pending"] = False
+            else:
+                updated["refresh_retry_at"] = 0
+            if not await self._commit_account(provider, generation, record, updated):
+                return False
             if updated["state"] == "expired":
                 await self._notice(provider, "expired")
             return updated["state"] == "valid"
@@ -719,8 +944,32 @@ class AuthManager:
             generation = self._generation[provider]
         if not record:
             return AudioResult("unavailable", reason="该平台账号尚未登录。")
-        if record["state"] == "expired":
-            return AudioResult("expired", reason="该平台账号登录已失效。")
+        if record["state"] != "valid" or record.get("pending_credential"):
+            try:
+                ready = await self._check_provider(
+                    provider,
+                    expected_generation=generation,
+                    expected_credential=record["credential"],
+                )
+            except Exception:
+                ready = False
+            async with self._lock:
+                record = copy.deepcopy(self._state["accounts"].get(provider))
+                if (
+                    self._closed
+                    or self._storage_failed
+                    or self._generation[provider] != generation
+                ):
+                    return AudioResult("transient", reason="账号状态已变化，请重试。")
+            if not ready or not record:
+                return AudioResult(
+                    "expired"
+                    if record and record["state"] == "expired"
+                    else "transient",
+                    reason="账号登录已失效，请重新登录。"
+                    if record and record["state"] == "expired"
+                    else "账号正在自动续期或等待验证，请稍后重试。",
+                )
         result = await self._resolve_checked(
             provider, song, record["credential"], generation
         )
@@ -757,27 +1006,38 @@ class AuthManager:
                     return AudioResult(
                         "transient", reason="账号凭据存储异常，账号线路已停用。"
                     )
+                return AudioResult(
+                    "transient", reason="账号已续期，取歌状态尚待复查，请稍后重试。"
+                )
             return result
+        async with self._lock:
+            current = self._state["accounts"].get(provider)
+            expired = bool(current and current["state"] == "expired")
         return AudioResult(
-            "expired", reason="该平台账号登录已失效，请管理员在私聊重新登录。"
+            "expired" if expired else "transient",
+            reason="该平台账号登录已失效，请管理员在私聊重新登录。"
+            if expired
+            else "账号正在自动续期，请稍后重试。",
         )
 
     async def _mark_expired(self, provider, generation, credential):
-        async with self._lock:
-            record = self._state["accounts"].get(provider)
-            if (
-                self._closed
-                or self._storage_failed
-                or self._generation[provider] != generation
-                or not record
-                or record["credential"] != credential
-            ):
-                return
-            state = copy.deepcopy(self._state)
-            state["accounts"][provider]["state"] = "expired"
-            state["accounts"][provider]["refresh_attempted"] = True
-            self._save(state)
-        await self._notice(provider, "expired")
+        async with self._check_locks[provider]:
+            async with self._lock:
+                record = self._state["accounts"].get(provider)
+                if (
+                    self._closed
+                    or self._storage_failed
+                    or self._generation[provider] != generation
+                    or not record
+                    or record["credential"] != credential
+                    or record.get("pending_credential")
+                ):
+                    return
+                state = copy.deepcopy(self._state)
+                state["accounts"][provider] = self._defer_refresh(
+                    record, retry_refresh=False
+                )
+                self._save(state)
 
     async def _resolve_checked(self, provider, song, credential, generation):
         result = await self._resolve(provider, song, credential)
@@ -789,6 +1049,7 @@ class AuthManager:
                 or self._generation[provider] != generation
                 or not record
                 or record["credential"] != credential
+                or record.get("pending_credential")
             ):
                 return AudioResult(
                     "transient", reason="账号状态已变化，已丢弃旧账号的取歌结果。"

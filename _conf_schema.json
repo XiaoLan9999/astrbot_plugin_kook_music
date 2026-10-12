@@ -70,10 +70,16 @@
     },
     "music_auth_check_interval": {
         "description": "音乐账号登录状态检查间隔（秒）",
-        "hint": "启动检查后按此周期复查；仅明确登录失效才尝试刷新/提醒，网络异常保留原凭据。",
+        "hint": "启动后按此周期复查；QQ 音乐会按凭据到期时间提前续期，临时失败按退避时间提前重试。仅确认无法续期且当前登录已失效时提醒重新扫码。",
         "type": "int",
         "slider": {"min": 300, "max": 86400, "step": 300},
         "default": 1800
+    },
+    "music_auth_refresh_lead_seconds": {
+        "description": "QQ音乐提前续期时间（秒）",
+        "hint": "默认在音乐登录凭据到期前 1 小时自动刷新；实际提前量不超过该凭据有效期的四分之一。0 表示不提前刷新；有效期未知时仍每 12 小时低频维护。网络失败保留凭据并延迟重试。",
+        "type": "int",
+        "default": 3600
     },
     "music_auth_notice_cooldown": {
         "description": "同类音乐账号私聊提醒最短间隔（秒）",
