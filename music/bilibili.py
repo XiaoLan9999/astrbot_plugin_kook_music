@@ -3,11 +3,13 @@
 import asyncio
 import ipaddress
 import logging
+import json
 import random
 import re
 import time
 import uuid
 from dataclasses import dataclass
+from http.cookiejar import Cookie
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -15,12 +17,11 @@ import aiohttp
 import yt_dlp
 
 from .model import Song
+from ..music_auth.bilibili_cookie import COOKIE_NAMES, parse_bilibili_cookie
 
 logger = logging.getLogger("astrbot")
 
-_VIDEO_PATH_PATTERN = re.compile(
-    r"^/video/(BV[A-Za-z0-9]{10})(?:/|$)", re.IGNORECASE
-)
+_VIDEO_PATH_PATTERN = re.compile(r"^/video/(BV[A-Za-z0-9]{10})(?:/|$)", re.IGNORECASE)
 _FAVORITE_PATH_PATTERNS = (
     re.compile(
         r"^/(?:medialist/(?:detail|play)|list)/ml(\d+)(?:/|$)",
@@ -54,14 +55,7 @@ class BilibiliExtractor:
     API_MIN_INTERVAL = 0.9
     SHORT_LINK_HOSTS = {"b23.tv", "bili2233.cn"}
     RETRYABLE_API_CODES = {-412, -509, -352}
-    COOKIE_NAMES = {
-        "SESSDATA",
-        "bili_jct",
-        "DedeUserID",
-        "DedeUserID__ckMd5",
-        "buvid3",
-        "buvid4",
-    }
+    COOKIE_NAMES = COOKIE_NAMES
     API_HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -75,6 +69,8 @@ class BilibiliExtractor:
         self._ffmpeg_path: str = ""
         self._cookies_file: str = ""
         self._cookie_header: str = ""
+        self._cookie_values: dict[str, str] = {}
+        self._credential_generation = 0
         self._session: aiohttp.ClientSession | None = None
         self._session_loop: asyncio.AbstractEventLoop | None = None
         self._video_view_cache: dict[str, tuple[float, dict | None]] = {}
@@ -89,41 +85,81 @@ class BilibiliExtractor:
         self._ffmpeg_path = path
 
     def set_cookies_file(self, path: str):
-        """设置 B站 cookies 文件路径（Netscape 格式）"""
-        if path and Path(path).exists():
-            self._cookies_file = path
-            self._cookie_header = self._read_cookie_header(Path(path))
-            self._video_view_cache.clear()
-            self._favorite_page_cache.clear()
-            logger.info(f"[KookMusic] 已加载 B站 cookies 文件: {path}")
+        """Read a legacy cookie export without rewriting the original file."""
+        try:
+            source = Path(path)
+            if not source.is_file() or source.stat().st_size > 64 * 1024:
+                return False
+            return self.set_cookie(
+                source.read_text(encoding="utf-8-sig"), source.parent
+            )
+        except (OSError, UnicodeError, ValueError):
+            logger.warning("[KookMusic] B站 Cookie 文件读取失败")
+            return False
 
     def set_cookie(self, sessdata: str, data_dir: Path):
-        """从 SESSDATA 值生成 cookies 文件供 yt-dlp 使用。
+        """Accept supported exports while keeping credentials only in memory."""
+        try:
+            credential = parse_bilibili_cookie(sessdata)
+        except ValueError:
+            logger.warning("[KookMusic] B站 Cookie 格式无效，原登录态未更改")
+            return False
+        return self.set_auth_cookies(credential["cookies"])
 
-        Args:
-            sessdata: B站 SESSDATA cookie 值
-            data_dir: 插件数据目录，用于存放生成的 cookies 文件
-        """
-        sessdata = sessdata.strip()
-        if not sessdata:
-            return
-        if any(char in sessdata for char in "\r\n\t;"):
-            logger.warning("[KookMusic] B站 SESSDATA 含有非法字符，已拒绝")
-            return
-
-        data_dir.mkdir(parents=True, exist_ok=True)
-        cookies_path = data_dir / "bili_cookies.txt"
-
-        # 写入 Netscape cookies 格式
-        with open(cookies_path, "w", encoding="utf-8") as f:
-            f.write("# Netscape HTTP Cookie File\n")
-            f.write(f".bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\t{sessdata}\n")
-
-        self._cookies_file = str(cookies_path)
-        self._cookie_header = f"SESSDATA={sessdata}"
+    def set_auth_cookies(self, cookies: dict | None):
+        if cookies is None:
+            values = {}
+        else:
+            if not isinstance(cookies, dict) or any(
+                key not in self.COOKIE_NAMES or not isinstance(value, str)
+                for key, value in cookies.items()
+            ):
+                raise ValueError("Invalid Bilibili credential")
+            exported = [
+                {"name": key, "value": value, "domain": ".bilibili.com", "path": "/"}
+                for key, value in cookies.items()
+            ]
+            values = parse_bilibili_cookie(json.dumps(exported))["cookies"]
+        if values == self._cookie_values:
+            return True
+        self._cookie_values = dict(values)
+        self._credential_generation += 1
+        self._cookies_file = ""
+        self._cookie_header = "; ".join(
+            f"{key}={value}" for key, value in values.items()
+        )
         self._video_view_cache.clear()
         self._favorite_page_cache.clear()
-        logger.info("[KookMusic] 已从配置生成 B站 cookies 文件")
+        for task in self._favorite_page_tasks.values():
+            task.cancel()
+        self._favorite_page_tasks.clear()
+        return True
+
+    def _create_ydl(self, options):
+        ydl = yt_dlp.YoutubeDL(options)
+        for name, value in tuple(self._cookie_values.items()):
+            ydl.cookiejar.set_cookie(
+                Cookie(
+                    version=0,
+                    name=name,
+                    value=value,
+                    port=None,
+                    port_specified=False,
+                    domain=".bilibili.com",
+                    domain_specified=True,
+                    domain_initial_dot=True,
+                    path="/",
+                    path_specified=True,
+                    secure=True,
+                    expires=None,
+                    discard=True,
+                    comment=None,
+                    comment_url=None,
+                    rest={"HttpOnly": None} if name == "SESSDATA" else {},
+                    rfc2109=False,
+                )
+            )
+        return ydl
 
     async def close(self):
         tasks = list(self._favorite_page_tasks.values())
@@ -152,7 +188,9 @@ class BilibiliExtractor:
             except Exception:
                 pass
         if self._session is None:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(
+                cookie_jar=aiohttp.DummyCookieJar(), trust_env=False
+            )
             self._session_loop = current_loop
         return self._session
 
@@ -163,17 +201,14 @@ class BilibiliExtractor:
             for raw_line in path.read_text(encoding="utf-8").splitlines():
                 line = raw_line.strip()
                 if line.startswith("#HttpOnly_"):
-                    line = line[len("#HttpOnly_"):]
+                    line = line[len("#HttpOnly_") :]
                 elif not line or line.startswith("#"):
                     continue
                 fields = line.split("\t")
                 if len(fields) < 7:
                     continue
                 domain = fields[0].lstrip(".").lower()
-                if (
-                    domain != "bilibili.com"
-                    and not domain.endswith(".bilibili.com")
-                ):
+                if domain != "bilibili.com" and not domain.endswith(".bilibili.com"):
                     continue
                 name, value = fields[5], fields[6]
                 if (
@@ -232,7 +267,7 @@ class BilibiliExtractor:
         if not match:
             return None, 1, False
         page, explicit_page, valid_page = cls._parse_page_query(
-            text[match.end():].lstrip("?")
+            text[match.end() :].lstrip("?")
         )
         if not valid_page:
             return None, 1, True
@@ -294,8 +329,7 @@ class BilibiliExtractor:
             return ""
         if re.fullmatch(r"/\d+/favlist/?", parsed.path, re.IGNORECASE):
             query = {
-                key.lower(): values
-                for key, values in parse_qs(parsed.query).items()
+                key.lower(): values for key, values in parse_qs(parsed.query).items()
             }
             values = query.get("fid", [])
             if values and values[0].isdigit():
@@ -331,7 +365,7 @@ class BilibiliExtractor:
     def _https_url(value: object) -> str:
         url = str(value or "")
         if url.startswith("http://"):
-            url = "https://" + url[len("http://"):]
+            url = "https://" + url[len("http://") :]
         elif url.startswith("//"):
             url = "https:" + url
         return url if urlparse(url).scheme == "https" else ""
@@ -394,9 +428,8 @@ class BilibiliExtractor:
         user_agent = clean("user-agent", cls.API_HEADERS["User-Agent"])
         referer = clean("referer", cls.API_HEADERS["Referer"])
         parsed_referer = urlparse(referer)
-        if (
-            parsed_referer.scheme != "https"
-            or not cls._is_bilibili_host(parsed_referer.hostname or "")
+        if parsed_referer.scheme != "https" or not cls._is_bilibili_host(
+            parsed_referer.hostname or ""
         ):
             referer = cls.API_HEADERS["Referer"]
         return {"User-Agent": user_agent, "Referer": referer}
@@ -409,6 +442,7 @@ class BilibiliExtractor:
             return default
 
     async def _api_get_json(self, url: str, params: dict) -> dict | None:
+        generation = self._credential_generation
         headers = dict(self.API_HEADERS)
         if self._cookie_header:
             headers["Cookie"] = self._cookie_header
@@ -419,17 +453,24 @@ class BilibiliExtractor:
                     throttle_delay = self._next_api_request_at - time.monotonic()
                     if throttle_delay > 0:
                         await asyncio.sleep(throttle_delay)
+                    if generation != self._credential_generation:
+                        return None
                     session = await self._get_session()
+                    if generation != self._credential_generation:
+                        return None
                     async with session.get(
                         url,
                         params=params,
                         headers=headers,
                         timeout=aiohttp.ClientTimeout(total=20),
+                        allow_redirects=False,
                     ) as resp:
                         status = resp.status
                         retry_after = resp.headers.get("Retry-After", "")
                         if status == 200:
                             result = await resp.json(content_type=None)
+                            if generation != self._credential_generation:
+                                return None
                             if not isinstance(result, dict):
                                 self._schedule_next_api_request()
                                 return None
@@ -455,9 +496,9 @@ class BilibiliExtractor:
                         except ValueError:
                             retry_delay = 0.0
                     if status in {412, 429}:
-                        retry_delay = max(retry_delay, 5.0 * (2 ** attempt))
+                        retry_delay = max(retry_delay, 5.0 * (2**attempt))
                     elif status >= 500:
-                        retry_delay = max(retry_delay, 0.75 * (2 ** attempt))
+                        retry_delay = max(retry_delay, 0.75 * (2**attempt))
                     if not retryable:
                         return None
                     self._next_api_request_at = max(
@@ -466,9 +507,9 @@ class BilibiliExtractor:
                     )
             except Exception as e:
                 logger.warning(
-                    f"[KookMusic] B站 API 请求失败（第 {attempt + 1}/3 次）: {e}"
+                    f"[KookMusic] B站 API 请求失败（第 {attempt + 1}/3 次）: {type(e).__name__}"
                 )
-                retry_delay = max(retry_delay, 0.75 * (2 ** attempt))
+                retry_delay = max(retry_delay, 0.75 * (2**attempt))
             if attempt < 2:
                 await asyncio.sleep(retry_delay)
         return None
@@ -483,11 +524,18 @@ class BilibiliExtractor:
         )
 
     async def _fetch_video_view(self, bvid: str) -> dict | None:
+        generation = self._credential_generation
         cached = self._video_view_cache.get(bvid)
         if cached and cached[0] > time.monotonic():
             return cached[1]
         result = await self._api_get_json(self.VIEW_API_URL, {"bvid": bvid})
-        if not result or result.get("code") != 0 or not isinstance(result.get("data"), dict):
+        if generation != self._credential_generation:
+            return None
+        if (
+            not result
+            or result.get("code") != 0
+            or not isinstance(result.get("data"), dict)
+        ):
             self._cache_video_view(bvid, None, ttl=15)
             return None
         view = result["data"]
@@ -511,10 +559,7 @@ class BilibiliExtractor:
             ),
             None,
         )
-        if (
-            not re.fullmatch(r"BV[A-Za-z0-9]{10}", bvid, re.IGNORECASE)
-            or not page_info
-        ):
+        if not re.fullmatch(r"BV[A-Za-z0-9]{10}", bvid, re.IGNORECASE) or not page_info:
             return None
         title = str(view.get("title", "") or "未知视频")
         part = str(page_info.get("part", "") or f"P{page}")
@@ -652,6 +697,7 @@ class BilibiliExtractor:
         favorite_id: str,
         page_num: int,
     ) -> dict | None:
+        generation = self._credential_generation
         cache_key = (favorite_id, page_num)
         result = await self._api_get_json(
             self.FAVORITE_API_URL,
@@ -666,7 +712,7 @@ class BilibiliExtractor:
                 "platform": "web",
             },
         )
-        if not result:
+        if generation != self._credential_generation or not result:
             return None
         if result.get("code") == -403:
             logger.warning("[KookMusic] B站收藏夹为私密内容，请配置有效 Cookie")
@@ -722,9 +768,7 @@ class BilibiliExtractor:
     ) -> list[Song] | None:
         """仅读取用户最终选中区间覆盖的收藏夹分页。"""
         favorite_entries = [
-            song
-            for song in songs
-            if song.provider_data.get("needs_materialize")
+            song for song in songs if song.provider_data.get("needs_materialize")
         ]
         if not favorite_entries:
             return songs
@@ -772,8 +816,6 @@ class BilibiliExtractor:
         }
         if self._ffmpeg_path:
             opts["ffmpeg_location"] = self._ffmpeg_path
-        if self._cookies_file:
-            opts["cookiefile"] = self._cookies_file
         return opts
 
     async def extract(self, text: str) -> Song | None:
@@ -782,8 +824,9 @@ class BilibiliExtractor:
         Returns:
             Song 对象（audio_url 设为视频URL作为标记），失败返回 None
         """
+        generation = self._credential_generation
         text = await self.resolve_input(text)
-        if not text:
+        if generation != self._credential_generation or not text:
             return None
         bvid, page, explicit_page = self.parse_video_input(text)
         if bvid is None:
@@ -796,6 +839,8 @@ class BilibiliExtractor:
             bvid = await self._search_first_bvid(text)
             if bvid is None:
                 search_url = await asyncio.to_thread(self._yt_search_first_url, text)
+                if generation != self._credential_generation:
+                    return None
                 if not search_url:
                     logger.warning(f"[KookMusic] B站搜索无结果: {text}")
                     return None
@@ -807,6 +852,8 @@ class BilibiliExtractor:
                 explicit_page = True
 
         view = await self._fetch_video_view(bvid)
+        if generation != self._credential_generation:
+            return None
         if view:
             pages = view.get("pages") if isinstance(view.get("pages"), list) else []
             if not explicit_page and len(pages) > 1:
@@ -829,10 +876,10 @@ class BilibiliExtractor:
         try:
             info = await asyncio.to_thread(self._yt_extract_info, url)
         except Exception as e:
-            logger.warning(f"[KookMusic] yt-dlp 解析B站视频失败: {e}")
+            logger.warning(f"[KookMusic] yt-dlp 解析B站视频失败: {type(e).__name__}")
             return None
 
-        if not info:
+        if generation != self._credential_generation or not info:
             return None
 
         title = info.get("title", "未知视频")
@@ -885,12 +932,14 @@ class BilibiliExtractor:
 
     async def _search_page_first_bvid(self, keyword: str) -> str | None:
         headers = dict(self.API_HEADERS)
-        headers.update({
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            ),
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        })
+        headers.update(
+            {
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                ),
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            }
+        )
         try:
             async with self._api_lock:
                 throttle_delay = self._next_api_request_at - time.monotonic()
@@ -927,13 +976,15 @@ class BilibiliExtractor:
 
     def _yt_search_first_url(self, keyword: str) -> str:
         opts = self._base_ydl_opts()
-        opts.update({
-            "skip_download": True,
-            "extract_flat": True,
-            "playlistend": 1,
-        })
+        opts.update(
+            {
+                "skip_download": True,
+                "extract_flat": True,
+                "playlistend": 1,
+            }
+        )
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with self._create_ydl(opts) as ydl:
                 info = ydl.extract_info(f"bilisearch1:{keyword}", download=False)
             entries = info.get("entries") if isinstance(info, dict) else None
             entry = entries[0] if isinstance(entries, list) and entries else None
@@ -953,7 +1004,7 @@ class BilibiliExtractor:
         opts["skip_download"] = True
         opts["noplaylist"] = True
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with self._create_ydl(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         except Exception as e:
             logger.warning(f"[KookMusic] yt-dlp extract_info 异常: {e}")
@@ -1021,6 +1072,7 @@ class BilibiliExtractor:
 
     async def resolve_audio_stream(self, song: Song) -> Song:
         """在歌曲即将播放时解析一次短期有效的 B站音频 CDN 地址。"""
+        generation = self._credential_generation
         url = self._video_url_from_song(song)
         song.stream_url = ""
         song.extra_headers = {}
@@ -1035,6 +1087,9 @@ class BilibiliExtractor:
         for attempt in range(2):
             try:
                 payload = await asyncio.to_thread(self._yt_resolve_audio_stream, url)
+                if generation != self._credential_generation:
+                    song.unplayable_reason = "B站账号状态已变化，请重新播放"
+                    return song
             except Exception as e:
                 logger.warning(
                     f"[KookMusic] B站流地址解析异常（第 {attempt + 1}/2 次）: "
@@ -1046,7 +1101,9 @@ class BilibiliExtractor:
             stream_url = self._safe_stream_url(payload.get("url"))
             if stream_url:
                 song.stream_url = stream_url
-                song.extra_headers = self._safe_stream_headers(payload.get("http_headers"))
+                song.extra_headers = self._safe_stream_headers(
+                    payload.get("http_headers")
+                )
                 if not song.name or song.name == "未知视频":
                     song.name = str(payload.get("title", "") or song.name)
                 if not song.artists or song.artists == "未知UP主":
@@ -1065,9 +1122,7 @@ class BilibiliExtractor:
                         pass
                 if not song.cover_url:
                     song.cover_url = self._https_url(payload.get("thumbnail"))
-                logger.info(
-                    f"[KookMusic] B站音频流已就绪: {song.display_name}"
-                )
+                logger.info(f"[KookMusic] B站音频流已就绪: {song.display_name}")
                 return song
             if attempt == 0:
                 await asyncio.sleep(0.5)
@@ -1079,12 +1134,14 @@ class BilibiliExtractor:
     def _yt_resolve_audio_stream(self, url: str) -> dict:
         """同步调用 yt-dlp 选择一条纯音频流，不下载媒体文件。"""
         opts = self._base_ydl_opts()
-        opts.update({
-            "format": self.AUDIO_FORMAT,
-            "skip_download": True,
-            "noplaylist": True,
-        })
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        opts.update(
+            {
+                "format": self.AUDIO_FORMAT,
+                "skip_download": True,
+                "noplaylist": True,
+            }
+        )
+        with self._create_ydl(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if not self._is_audio_only_media(info):
             return {}
@@ -1110,6 +1167,7 @@ class BilibiliExtractor:
         Returns:
             更新了 file_path 的 Song 对象
         """
+        generation = self._credential_generation
         url = self._video_url_from_song(song)
         if not url:
             logger.error(f"[KookMusic] B站下载缺少有效 BVID: {song.id}")
@@ -1126,6 +1184,10 @@ class BilibiliExtractor:
         )
         try:
             result_path = await asyncio.shield(download_task)
+            if generation != self._credential_generation:
+                self._cleanup_cancelled_download(output_base)
+                song.unplayable_reason = "B站账号状态已变化，请重新播放"
+                return song
             if result_path and Path(result_path).exists():
                 song.file_path = result_path
                 song.unplayable_reason = ""
@@ -1143,7 +1205,7 @@ class BilibiliExtractor:
             raise
         except Exception as e:
             self._cleanup_cancelled_download(output_base)
-            logger.error(f"[KookMusic] yt-dlp 下载失败: {e}")
+            logger.error(f"[KookMusic] yt-dlp 下载失败: {type(e).__name__}")
 
         return song
 
@@ -1167,13 +1229,15 @@ class BilibiliExtractor:
     def _yt_download_audio(self, url: str, output_base: str) -> str:
         """同步调用 yt-dlp 下载音频"""
         opts = self._base_ydl_opts()
-        opts.update({
-            "format": self.AUDIO_FORMAT,
-            "outtmpl": output_base + ".%(ext)s",
-            "noplaylist": True,
-        })
+        opts.update(
+            {
+                "format": self.AUDIO_FORMAT,
+                "outtmpl": output_base + ".%(ext)s",
+                "noplaylist": True,
+            }
+        )
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with self._create_ydl(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if not self._is_audio_only_media(info):
                 self._cleanup_cancelled_download(output_base)

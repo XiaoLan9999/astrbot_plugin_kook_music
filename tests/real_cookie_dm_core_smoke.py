@@ -61,7 +61,7 @@ async def smoke():
             raise AssertionError(label)
         checks += 1
 
-    check(VERSION in {"4.28.1", "4.28.2"}, "smoke uses a supported real AstrBot version")
+    check(VERSION in {"4.28.1", "4.28.2", "4.29.1"}, "smoke uses a supported real AstrBot version")
     check(Metric._is_disabled(), "metrics disabled before importing core")
     queue = asyncio.Queue()
     adapters = [
@@ -221,6 +221,15 @@ async def smoke():
         "synthetic-blocked-secret-only",
         "synthetic-raw-secret-only",
         "synthetic-closing-secret-only",
+    )
+    bili_markers = (
+        "synthetic-bili-header-secret-only",
+        "synthetic-bili-json-secret-only",
+        "synthetic-bili-netscape-secret-only",
+        "synthetic-bili-blocked-secret-only",
+        "synthetic-bili-raw-secret-only",
+        "synthetic-bili-late-bare-secret-only",
+        "synthetic-bili-csrf-secret-only",
     )
     private_send = AsyncMock(return_value=("synthetic-message-id", None))
     deletion = AsyncMock(return_value={})
@@ -438,6 +447,209 @@ async def smoke():
                     for message in capture.messages
                 ),
                 "no credential marker reaches core or plugin logs",
+            )
+
+            bili_start = len(imports)
+            bili_replies = private_send.await_count
+            bili_recalls = deletion.await_count
+            bili_formats = (
+                (
+                    "Bilibili Header String",
+                    f"SESSDATA={bili_markers[0]}; bili_jct={bili_markers[6]}; DedeUserID=42",
+                ),
+                (
+                    "Bilibili JSON",
+                    "```json\n"
+                    + json.dumps(
+                        [
+                            {
+                                "name": "SESSDATA",
+                                "value": bili_markers[1],
+                                "domain": ".bilibili.com",
+                                "path": "/",
+                            },
+                            {
+                                "name": "bili_jct",
+                                "value": bili_markers[6],
+                                "domain": ".bilibili.com",
+                                "path": "/",
+                            },
+                            {
+                                "name": "DedeUserID",
+                                "value": "42",
+                                "domain": ".bilibili.com",
+                                "path": "/",
+                            },
+                        ]
+                    )
+                    + "\n```",
+                ),
+                (
+                    "Bilibili Netscape",
+                    "```\n# Netscape HTTP Cookie File\n"
+                    f"#HttpOnly_.bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\t{bili_markers[2]}\n"
+                    f".bilibili.com\tTRUE\t/\tTRUE\t0\tbili_jct\t{bili_markers[6]}\n"
+                    ".bilibili.com\tTRUE\t/\tTRUE\t0\tDedeUserID\t42\n```",
+                ),
+            )
+            for index, (label, payload) in enumerate(bili_formats):
+                now[0] += 61
+                if index == 0:
+                    await consumed("#音乐Cookie B站\n" + payload)
+                else:
+                    await consumed("#音乐Cookie B站")
+                    window = plugin._music_cookie_intake.windows.get(
+                        (id(primary.client), "123")
+                    )
+                    check(
+                        window is not None and window[2] == "bilibili",
+                        label + " opens a platform-bound window",
+                    )
+                    await consumed(payload)
+                check(
+                    len(imports) == bili_start + index + 1,
+                    label + " reaches synthetic official validator",
+                )
+                check(
+                    imports[-1]
+                    == (
+                        "bilibili",
+                        {
+                            "cookies": {
+                                "SESSDATA": bili_markers[index],
+                                "bili_jct": bili_markers[6],
+                                "DedeUserID": "42",
+                            }
+                        },
+                        primary.config["id"],
+                        "123",
+                    ),
+                    label + " preserves provider identity and authentication values",
+                )
+                check(
+                    manager.prepare_manual_handoff.await_args.kwargs
+                    == {"provider": "bilibili"},
+                    label + " hands off only Bilibili account generation",
+                )
+                check(
+                    not plugin._music_cookie_intake.windows,
+                    label + " consumes the private window",
+                )
+                check(
+                    deletion.await_count == bili_recalls + index + 1,
+                    label + " attempts private recall",
+                )
+
+            now[0] += 61
+            for command, method, args in (
+                (
+                    "#音乐登录 B站",
+                    "start_login",
+                    ("bilibili", "qr", primary.config["id"], "123"),
+                ),
+                (
+                    "#取消音乐登录 B站",
+                    "cancel_login",
+                    ("bilibili", primary.config["id"], "123"),
+                ),
+                (
+                    "#退出音乐账号 B站",
+                    "logout",
+                    ("bilibili", primary.config["id"], "123"),
+                ),
+            ):
+                await consumed(command)
+                check(
+                    getattr(manager, method).await_args.args == args,
+                    "Bilibili account command stays in the authorized private channel",
+                )
+
+            bili_blocked = (
+                "#音乐Cookie B站\nSESSDATA=" + bili_markers[3]
+                + "; bili_jct=" + bili_markers[6]
+            )
+            for kwargs in (
+                {"private": False},
+                {"actor": "456"},
+                {"adapter": other},
+                {"actor": primary.client.bot_id},
+            ):
+                before, replies = len(imports), private_send.await_count
+                await consumed(bili_blocked, **kwargs)
+                check(len(imports) == before, "untrusted scope cannot import Bilibili")
+                check(
+                    private_send.await_count == replies,
+                    "untrusted Bilibili input receives no private reply",
+                )
+
+            now[0] += 61
+            await consumed("bili_jct=" + bili_markers[6])
+            await consumed("SESSDATA=" + bili_markers[3])
+            check(
+                len(imports) == bili_start + 3,
+                "unsolicited Bilibili secrets never reach validation",
+            )
+            await consumed("#音乐Cookie B站")
+            now[0] += 181
+            await normal("ordinary group message after Bilibili expiry", private=False)
+            check(
+                bool(plugin._music_cookie_intake.expired_windows),
+                "expired Bilibili window keeps a bounded late-secret guard",
+            )
+            await consumed("#音乐账号状态")
+            check(
+                bool(plugin._music_cookie_intake.expired_windows),
+                "private status does not consume late-secret guard",
+            )
+            await consumed(bili_markers[5])
+            check(
+                len(imports) == bili_start + 3,
+                "late bare SESSDATA is consumed without validation",
+            )
+            check(
+                not plugin._music_cookie_intake.expired_windows,
+                "late-secret guard consumes only one private message",
+            )
+            check(
+                "窗口已过期" in private_send.await_args.args[2],
+                "late bare SESSDATA receives only a safe expiry notice",
+            )
+            await normal("ordinary private message after one-use Bilibili guard")
+
+            now[0] += 61
+            await consumed("#音乐Cookie B站")
+            now[0] += 481
+            await normal("ordinary private message after Bilibili guard timeout")
+            check(
+                not plugin._music_cookie_intake.expired_windows,
+                "Bilibili guard cannot consume ordinary private messages indefinitely",
+            )
+            await consumed(
+                "safe Bilibili rendered placeholder",
+                raw_content="SESSDATA=" + bili_markers[4]
+                + "; bili_jct=" + bili_markers[6],
+            )
+            check(
+                len(imports) == bili_start + 3,
+                "Bilibili raw markdown cannot bypass pre-core interception",
+            )
+            for call in private_send.await_args_list[bili_replies:]:
+                check(
+                    call.args[0] == primary.config["kook_bot_token"],
+                    "Bilibili replies use the bound actual bot token",
+                )
+                check(call.args[1] == "123", "Bilibili replies target only the owner")
+                check(
+                    not any(marker in str(call) for marker in bili_markers),
+                    "Bilibili private replies do not echo authentication values",
+                )
+            check(
+                not any(
+                    marker in message
+                    for marker in bili_markers
+                    for message in capture.messages
+                ),
+                "Bilibili cookie values never reach actual Core or plugin logs",
             )
 
             now[0] += 61

@@ -16,10 +16,14 @@ _COMMAND = re.compile(
     re.IGNORECASE,
 )
 _SECRET = re.compile(
-    r"MUSIC(?:\\?_)+(?:U|A|R(?:\\?_)+T)\b|(?:\\?_){2}csrf\b|Netscape HTTP Cookie File",
+    r"MUSIC(?:\\?_)+(?:U|A|R(?:\\?_)+T)\b|(?:\\?_){2}csrf\b"
+    r"|SESSDATA\b|bili(?:\\?_)+jct\b|DedeUserID(?:(?:\\?_){2}ckMd5)?\b"
+    r"|ac(?:\\?_)+time(?:\\?_)+value\b"
+    r"|Netscape HTTP Cookie File",
     re.IGNORECASE,
 )
 _MSG_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_EXPIRED_BILIBILI_GRACE_SECONDS = 300
 GUIDE = (
     "请先在网易云官网完成登录/安全验证，再私聊发送 #音乐Cookie 网易云，"
     "随后在接收窗口内发送一条完整 Cookie 文本。支持 Header String、JSON、Netscape，"
@@ -28,6 +32,19 @@ GUIDE = (
     "内容会经过 KOOK 私聊服务器，插件在进入 AstrBot 日志/其他插件前拦截；"
     "校验成功后会尝试撤回原消息，但不保证 KOOK 能删除用户消息。"
 )
+BILIBILI_GUIDE = (
+    "请先在哔哩哔哩官网完成登录，再私聊发送 #音乐Cookie B站，"
+    "随后在接收窗口内发送一条完整 Cookie 文本。支持 Header String、JSON、Netscape，"
+    "可包在代码块中。也可把 Cookie 放在命令后的下一行；不接受文件或下载链接。"
+    "超出 KOOK 单条消息长度时，请只保留 SESSDATA、bili_jct、DedeUserID，不要分条发送。"
+    "也可发送 #音乐登录 B站 获取二维码，使用哔哩哔哩 App 扫码并确认。"
+    "内容会经过 KOOK 私聊服务器，插件在进入 AstrBot 日志/其他插件前拦截；"
+    "校验成功后会尝试撤回原消息，但不保证 KOOK 能删除用户消息。"
+)
+
+
+def _provider_guide(provider):
+    return BILIBILI_GUIDE if provider == "bilibili" else GUIDE
 
 
 def _secret_text(text):
@@ -61,6 +78,7 @@ class PrivateCookieIntake:
         self.owner = owner
         self.clock = clock
         self.windows = {}
+        self.expired_windows = {}
         self.tasks = set()
         self.seen = {}
         self.rates = {}
@@ -78,7 +96,8 @@ class PrivateCookieIntake:
         if self.import_owner is not None:
             return self.import_owner[0]
         now = self.clock()
-        for (_, actor), (expires, generation) in self.windows.items():
+        for (_, actor), window in self.windows.items():
+            expires, generation = window[:2]
             if expires >= now and generation == self.generation:
                 return actor
         return None
@@ -107,6 +126,7 @@ class PrivateCookieIntake:
     def revoke(self, *, include_busy=False):
         self.generation += 1
         self.windows.clear()
+        self.expired_windows.clear()
         current = asyncio.current_task()
         for task in tuple(self.tasks):
             if task is not current and (include_busy or task not in self.busy_tasks):
@@ -166,18 +186,32 @@ class PrivateCookieIntake:
         actor = str(event_field(event, "author_id", "") or "")
         key = (id(client), actor)
         command = _COMMAND.match(text)
-        if key in self.windows and self.windows[key][0] < self.clock():
-            self.windows.pop(key)
+        now = self.clock()
+        if key in self.windows and self.windows[key][0] < now:
+            window = self.windows.pop(key)
+            if len(window) > 2 and window[2] == "bilibili":
+                # Bare SESSDATA has no marker; consume one late private message.
+                self.expired_windows[key] = window
+        self.expired_windows = {
+            expired_key: window
+            for expired_key, window in self.expired_windows.items()
+            if window[1] == self.generation
+            and window[0] + _EXPIRED_BILIBILI_GRACE_SECONDS >= now
+        }
         private = enum_value(event_field(event, "channel_type")) == "PERSON"
         pending = private and key in self.windows
+        expired = private and key in self.expired_windows
         sensitive = _secret_text(text)
-        if not (command or pending or sensitive):
+        if not (command or pending or expired or sensitive):
             return False
         # Once recognized, every failure stays consumed; never call the adapter.
         try:
             self.refresh()
             if not private:
                 return True
+            expired_window = (
+                self.expired_windows.pop(key, None) if command is None else None
+            )
             platform = self._eligible(client, token, actor)
             if (
                 platform is None
@@ -211,6 +245,8 @@ class PrivateCookieIntake:
                 if command and command[1] == "音乐账号状态"
                 else self.windows.pop(key, None)
             )
+            if command is None and window is None:
+                window = expired_window
             if command and command[1] != "音乐账号状态" and not other_import:
                 self.revoke()
             generation = self.generation
@@ -288,7 +324,7 @@ class PrivateCookieIntake:
                     await self.owner._notify_music_auth(
                         self.owner._account_platform_id(platform),
                         actor,
-                        "网易云手动接入处理异常（PRIVATE_IMPORT）。请先发送 #音乐账号状态 确认结果，再决定是否重试。",
+                        "音乐账号手动接入处理异常（PRIVATE_IMPORT）。请先发送 #音乐账号状态 确认结果，再决定是否重试。",
                     )
                 except Exception:
                     pass
@@ -320,6 +356,7 @@ class PrivateCookieIntake:
 
         if manager is None or not current():
             return
+        provider = window[2] if window is not None and len(window) > 2 else "netease"
         if busy and not (command and command[1] == "音乐账号状态"):
             await owner._notify_music_auth(
                 bot_id, actor, "其他管理员正在校验账号，请稍后重试。"
@@ -332,12 +369,24 @@ class PrivateCookieIntake:
             argument = text[command.end() :].strip()
             if name in {"音乐Cookie", "音乐验证"}:
                 match = re.match(
-                    r"(?:网易云|netease)(?:\s+|$)", argument, re.IGNORECASE
+                    r"(网易云|netease|B站|哔哩哔哩|bilibili|bili)(?:\s+|$)",
+                    argument,
+                    re.IGNORECASE,
                 )
                 if not match:
-                    await owner._notify_music_auth(bot_id, actor, GUIDE)
+                    await owner._notify_music_auth(
+                        bot_id, actor, GUIDE + "\n\n" + BILIBILI_GUIDE
+                    )
                     return
-                ok, _ = await manager.prepare_manual_handoff(bot_id, actor)
+                provider = (
+                    "netease" if match[1].lower() in {"网易云", "netease"} else "bilibili"
+                )
+                if provider == "netease":
+                    ok, _ = await manager.prepare_manual_handoff(bot_id, actor)
+                else:
+                    ok, _ = await manager.prepare_manual_handoff(
+                        bot_id, actor, provider=provider
+                    )
                 if not current():
                     return
                 if not ok:
@@ -357,9 +406,15 @@ class PrivateCookieIntake:
                         )
                     except (TypeError, ValueError, OverflowError):
                         ttl = 180
-                    self.windows[(id(client), actor)] = (self.clock() + ttl, generation)
+                    self.windows[(id(client), actor)] = (
+                        self.clock() + ttl,
+                        generation,
+                        provider,
+                    )
                     await owner._notify_music_auth(
-                        bot_id, actor, f"已开启 {ttl} 秒一次性接收窗口。\n" + GUIDE
+                        bot_id,
+                        actor,
+                        f"已开启 {ttl} 秒一次性接收窗口。\n" + _provider_guide(provider),
                     )
                     return
                 text = payload
@@ -381,7 +436,7 @@ class PrivateCookieIntake:
             await owner._notify_music_auth(
                 bot_id,
                 actor,
-                "未开启窗口或窗口已过期；请先发送 #音乐Cookie 网易云，再发送完整 Cookie。",
+                "未开启窗口或窗口已过期；请先发送 #音乐Cookie 网易云 或 #音乐Cookie B站，再发送完整 Cookie。",
             )
             return
         if not current():
@@ -389,9 +444,14 @@ class PrivateCookieIntake:
         operation = (actor, object())
         self.import_owner = operation
         try:
-            ok, detail = await owner._import_netease_cookie(
-                bot_id, actor, text, authorized=current
-            )
+            if provider == "netease":
+                ok, detail = await owner._import_netease_cookie(
+                    bot_id, actor, text, authorized=current
+                )
+            else:
+                ok, detail = await owner._import_music_cookie(
+                    provider, bot_id, actor, text, authorized=current
+                )
         finally:
             if self.import_owner is operation:
                 self.import_owner = None

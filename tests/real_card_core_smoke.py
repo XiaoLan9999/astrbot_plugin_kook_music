@@ -82,7 +82,7 @@ async def smoke():
             raise AssertionError(label)
         checks += 1
 
-    check(VERSION in {"4.28.1", "4.28.2"}, "supported real AstrBot version")
+    check(VERSION in {"4.28.1", "4.28.2", "4.29.1"}, "supported real AstrBot version")
     check(Metric._is_disabled(), "metrics disabled before importing core")
     queue = asyncio.Queue()
     adapter = KookPlatformAdapter(

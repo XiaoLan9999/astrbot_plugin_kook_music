@@ -30,6 +30,11 @@ _SAFE_LOGIN_STAGES = frozenset(
         "NETEASE_COOKIE",
         "NETEASE_REQUEST",
         "NETEASE_VERIFY",
+        "BILIBILI_QR",
+        "BILIBILI_POLL",
+        "BILIBILI_COOKIE",
+        "BILIBILI_CHECK",
+        "BILIBILI_TICKET",
     }
 )
 
@@ -53,7 +58,7 @@ class _PendingLogin:
 
 
 class AuthManager:
-    LABELS = {"qq": "QQ音乐", "netease": "网易云音乐"}
+    LABELS = {"qq": "QQ音乐", "netease": "网易云音乐", "bilibili": "B站"}
     REFRESH_RETRY_BASE = 60
     REFRESH_RETRY_MAX = 3600
     REFRESH_MAINTENANCE_INTERVAL = 43200
@@ -98,6 +103,7 @@ class AuthManager:
         self._closed = False
         self._storage_failed = False
         self.on_verification_required = None
+        self.on_account_changed = None
 
     def _authorized(self, bot_id, user_id):
         return (
@@ -119,6 +125,9 @@ class AuthManager:
         )
 
     def _save(self, state):
+        previous = self._state
+        if state["accounts"].get("bilibili", {}).get("state") == "valid":
+            state.pop("bilibili_config_disabled", None)
         try:
             self.store.save(state)
         except CredentialStoreError:
@@ -126,6 +135,22 @@ class AuthManager:
             raise
         self._state = state
         self._renewal_wakeup.set()
+        if self.on_account_changed is not None:
+            providers = previous["accounts"].keys() | state["accounts"].keys()
+            if previous.get("bilibili_config_disabled") != state.get(
+                "bilibili_config_disabled"
+            ):
+                providers.add("bilibili")
+            for provider in providers:
+                record = state["accounts"].get(provider)
+                if (
+                    record != previous["accounts"].get(provider)
+                    or provider == "bilibili"
+                ):
+                    try:
+                        self.on_account_changed(provider, copy.deepcopy(record))
+                    except Exception:
+                        logger.warning("[MusicAuth] account update stage=APPLY_FAILED")
 
     async def _send(self, bot_id, user_id, text, qr_bytes=None):
         try:
@@ -173,8 +198,13 @@ class AuthManager:
         """Validate user-submitted credentials without replacing a healthy account early."""
         if not self._authorized(bot_id, user_id):
             return False, "只有账号管理员可以接入音乐账号。"
-        if provider != "netease" or not isinstance(credential, dict) or not credential:
-            return False, "手动接入仅接受网易云登录态。"
+        if (
+            provider not in {"netease", "bilibili"}
+            or not isinstance(credential, dict)
+            or not credential
+        ):
+            return False, "手动接入仅接受网易云或B站登录态。"
+        label = self._label(provider)
         task = asyncio.current_task()
         async with self._lock:
             if self._closed or self._storage_failed or provider not in self.backends:
@@ -213,9 +243,9 @@ class AuthManager:
                     return (
                         False,
                         (
-                            "网易云官方未识别有效登录，请重新从已登录的官网导出 Cookie。"
+                            f"{label}官方未识别有效登录，请重新从已登录的官网导出 Cookie。"
                             if validity == "expired"
-                            else "网易云官方暂未能确认登录有效，请稍后重试。"
+                            else f"{label}官方暂未能确认登录有效，请稍后重试。"
                         )
                         + f" 原账号未更改。阶段：{stage}。",
                     )
@@ -230,7 +260,7 @@ class AuthManager:
                 stage = "SAVE_FAILED"
                 self._save(state)
             logger.info("[KookMusicAuth] manual import completed: IMPORT_OK")
-            return True, "网易云账号已通过官方校验并加密保存。"
+            return True, f"{label}账号已通过官方校验并加密保存。"
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -242,22 +272,27 @@ class AuthManager:
                     self._pending.pop(provider, None)
                 self._login_tasks.discard(task)
 
-    async def prepare_manual_handoff(self, bot_id, user_id):
+    async def prepare_manual_handoff(self, bot_id, user_id, provider="netease"):
         if not self._authorized(bot_id, user_id):
             return False, "只有账号管理员可以开始 Cookie 导入。"
         pending = None
         async with self._lock:
-            if self._closed or self._storage_failed or "netease" not in self.backends:
+            if (
+                self._closed
+                or self._storage_failed
+                or provider not in self.backends
+                or provider not in {"netease", "bilibili"}
+            ):
                 return False, "账号模块当前不可用。"
-            pending = self._pending.get("netease")
+            pending = self._pending.get(provider)
             if pending is not None and (pending.bot_id, pending.user_id) != (
                 bot_id,
                 user_id,
             ):
                 return False, "其他管理员正在登录此账号，请先由发起者完成或取消。"
-            self._generation["netease"] += 1
+            self._generation[provider] += 1
             if pending is not None:
-                self._pending.pop("netease", None)
+                self._pending.pop(provider, None)
                 if pending.task is not asyncio.current_task():
                     pending.task.cancel()
         if pending is not None and pending.task is not asyncio.current_task():
@@ -294,7 +329,7 @@ class AuthManager:
             sent, cleanup = await self._send(
                 pending.bot_id,
                 pending.user_id,
-                f"{label}登录二维码：请使用所选客户端扫码，并在手机端确认。不要转发二维码。",
+                f"{label}登录二维码：请使用{'哔哩哔哩 App' if provider == 'bilibili' else '所选客户端'}扫码，并在手机端确认。不要转发二维码。",
                 challenge.qr_bytes,
             )
             if callable(cleanup):
@@ -313,6 +348,11 @@ class AuthManager:
                     retryable = (
                         isinstance(error, TimeoutError) or error.kind == "transient"
                     )
+                    if provider == "bilibili" and _login_diagnostic(error, "") in {
+                        "BILIBILI_TICKET",
+                        "BILIBILI_COOKIE",
+                    }:
+                        retryable = False
                     if (
                         not retryable
                         or failures >= 3
@@ -529,6 +569,8 @@ class AuthManager:
                 pending.task.cancel()
             state = copy.deepcopy(self._state)
             state["accounts"].pop(provider, None)
+            if provider == "bilibili":
+                state["bilibili_config_disabled"] = True
             try:
                 self._save(state)
             except CredentialStoreError:
@@ -919,7 +961,11 @@ class AuthManager:
                         last = self._state["notices"].get(key, 0)
                         if time.time() - last < self.notice_cooldown:
                             continue
-                    command = "#音乐登录 QQ" if provider == "qq" else "#音乐登录 网易云"
+                    command = {
+                        "qq": "#音乐登录 QQ",
+                        "netease": "#音乐登录 网易云",
+                        "bilibili": "#音乐登录 B站",
+                    }.get(provider, "#音乐账号状态")
                     status = "尚未登录" if reason == "missing" else "登录已失效"
                     message = (
                         f"{self._label(provider)}账号线路{status}。"

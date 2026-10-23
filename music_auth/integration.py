@@ -44,6 +44,7 @@ class MusicAuthMixin:
         self._music_auth_lock = asyncio.Lock()
         self._music_auth_closed = False
         self._music_auth_failed = False
+        self._bilibili_config_credential = None
         from .private_cookie import PrivateCookieIntake
 
         self._music_cookie_intake = PrivateCookieIntake(self)
@@ -113,6 +114,53 @@ class MusicAuthMixin:
         )
         return result
 
+    async def _import_music_cookie(
+        self, provider, bot_id, user_id, text, *, authorized=None
+    ):
+        if provider == "netease":
+            return await self._import_netease_cookie(
+                bot_id, user_id, text, authorized=authorized
+            )
+        if provider != "bilibili" or not self._manual_auth_allowed(bot_id, user_id):
+            return False, "账号接入权限已变化。"
+        from .bilibili_cookie import parse_bilibili_cookie
+
+        try:
+            credential = parse_bilibili_cookie(text)
+        except ValueError:
+            return (
+                False,
+                "B站 Cookie 格式无效。请完整复制 JSON、Header String 或 Netscape；原账号未更改。",
+            )
+        manager = self._music_auth
+        return await manager.import_credentials(
+            provider,
+            credential,
+            bot_id,
+            user_id,
+            authorized=lambda: (
+                self._music_auth is manager
+                and self._manual_auth_allowed(bot_id, user_id)
+                and (authorized is None or authorized())
+            ),
+        )
+
+    def _on_music_account_changed(self, provider, record):
+        if provider != "bilibili" or self._music_auth_closed:
+            return
+        extractor = getattr(self, "bilibili", None)
+        if extractor is None:
+            return
+        credential = record.get("credential", {}) if record else {}
+        cookies = (
+            credential.get("cookies")
+            if record
+            and record.get("state") == "valid"
+            and not record.get("pending_credential")
+            else None
+        )
+        extractor.set_auth_cookies(cookies)
+
     def _account_platform(self):
         requested = str(self.config.get("music_auth_kook_bot_id", "") or "").strip()
         platforms = []
@@ -166,10 +214,15 @@ class MusicAuthMixin:
                 from .manager import AuthManager
                 from .netease_backend import NeteaseBackend
                 from .qq_backend import QQBackend
+                from .bilibili_backend import BilibiliBackend
 
                 manager = AuthManager(
                     credentials_dir=self.data_dir / "music_accounts",
-                    backends={"qq": QQBackend(), "netease": NeteaseBackend()},
+                    backends={
+                        "qq": QQBackend(),
+                        "netease": NeteaseBackend(),
+                        "bilibili": BilibiliBackend(),
+                    },
                     notify=self._notify_music_auth,
                     admin_ids=set(self._music_auth_admin_ids),
                     check_interval=_number(
@@ -201,9 +254,31 @@ class MusicAuthMixin:
             self._music_auth = manager
             self._music_auth_binding = binding
             manager.on_verification_required = self._verification_link
+            manager.on_account_changed = self._on_music_account_changed
+            stored = getattr(manager, "_state", {})
+            stored = stored if isinstance(stored, dict) else {}
+            record = stored.get("accounts", {}).get("bilibili")
+            if record or stored.get("bilibili_config_disabled", False):
+                self._on_music_account_changed("bilibili", record)
 
             async def start():
                 try:
+                    if (
+                        self._bilibili_config_credential
+                        and "bilibili" not in manager._state["accounts"]
+                        and not manager._state.get("bilibili_config_disabled", False)
+                    ):
+                        config_owner = sorted(self._music_auth_admin_ids)[0]
+                        await manager.import_credentials(
+                            "bilibili",
+                            self._bilibili_config_credential,
+                            binding[0],
+                            config_owner,
+                            authorized=lambda: (
+                                self._music_auth is manager
+                                and self._manual_auth_allowed(binding[0], config_owner)
+                            ),
+                        )
                     await manager.start(binding[0])
                 except asyncio.CancelledError:
                     raise
@@ -271,7 +346,7 @@ class MusicAuthMixin:
             .lower()
         )
         if command in {"音乐验证", "音乐Cookie"}:
-            return "私聊早期拦截尚未就绪，请稍后重新发送 #音乐Cookie 网易云；此路径不接收 Cookie。"
+            return "私聊早期拦截尚未就绪，请稍后重新发送 #音乐Cookie 网易云 或 #音乐Cookie B站；此路径不接收 Cookie。"
         options = {
             "qq": ("qq", "qq"),
             "微信": ("qq", "wechat"),
@@ -280,12 +355,16 @@ class MusicAuthMixin:
             "网易云": ("netease", "netease"),
             "netease": ("netease", "netease"),
             "网易云网页": ("netease", "netease_web"),
+            "b站": ("bilibili", "qr"),
+            "bilibili": ("bilibili", "qr"),
+            "bili": ("bilibili", "qr"),
+            "哔哩哔哩": ("bilibili", "qr"),
         }
         target = options.get(argument)
         if target is None:
-            return "私聊命令：音乐登录 qq / 音乐登录 微信 / 音乐登录 网易云 / 音乐登录 网易云网页；音乐Cookie 网易云；音乐账号状态；取消音乐登录 qq|网易云；退出音乐账号 qq|网易云。请勿发送密码。"
+            return "私聊命令：音乐登录 qq / 音乐登录 微信 / 音乐登录 网易云 / 音乐登录 B站；音乐Cookie 网易云|B站；音乐账号状态；取消音乐登录 qq|网易云|B站；退出音乐账号 qq|网易云|B站。请勿发送密码。"
         provider, method = target
-        if provider == "netease" and not intake:
+        if provider in {"netease", "bilibili"} and not intake:
             self._music_cookie_intake.revoke()
         if command == "音乐登录":
             ok, detail = await manager.start_login(provider, method, bot_id, actor)

@@ -194,15 +194,16 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             self.bilibili.set_ffmpeg_path(ffmpeg_path)
 
         # 加载 B站 Cookie
-        bili_cookie = self.config.get("bili_cookie", "").strip()
+        bili_cookie = self.config.get("bili_cookie", "")
+        loaded_bili_cookie = False
         if bili_cookie:
-            # 优先使用配置中填写的 SESSDATA
-            self.bilibili.set_cookie(bili_cookie, self.data_dir)
-        else:
-            # 回退：检查手动放置的 cookies 文件
+            loaded_bili_cookie = self.bilibili.set_cookie(bili_cookie, self.data_dir)
+        if not loaded_bili_cookie:
             bili_cookies_file = self.data_dir / "bili_cookies.txt"
             if bili_cookies_file.exists():
-                self.bilibili.set_cookies_file(str(bili_cookies_file))
+                loaded_bili_cookie = self.bilibili.set_cookies_file(str(bili_cookies_file))
+        if loaded_bili_cookie:
+            self._bilibili_config_credential = {"cookies": dict(self.bilibili._cookie_values)}
 
         # 注入 KOOK 按钮点击事件处理
         self._patch_kook_adapter()
@@ -1021,6 +1022,8 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
         """播放 <关键词/BV号/视频或收藏夹链接> — 播放视频音频"""
         if not self._is_kook(event):
             return
+        if getattr(self, "_music_auth_enabled", False):
+            await self._ensure_music_auth()
 
         if not self._kook_token:
             self._kook_token = self._find_kook_token()
@@ -1093,7 +1096,7 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             if self.bilibili.parse_favorite_input(raw_text):
                 await event.send(event.plain_result(
                     "❌ 无法读取 B站收藏夹；请确认收藏夹公开，"
-                    "私密收藏夹需要在插件配置中填写有效的 bili_cookie"
+                    "私密收藏夹需要管理员私聊 #音乐登录 B站，或配置有效的 bili_cookie"
                 ))
                 return
             await self._play_bilibili(event, raw_text, guild_id)
@@ -1564,6 +1567,8 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
         """
         # B站平台：短视频延迟下载，长视频/未知时长在开播前解析临时音频流。
         if song.platform == "bilibili":
+            if getattr(self, "_music_auth_enabled", False):
+                await self._ensure_music_auth()
             if not song.playback_source:
                 song = await self.bilibili.prepare_audio(
                     song,
@@ -1715,7 +1720,7 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             await event.send(event.plain_result(
                 f"❌ 无法解析B站视频：{keyword}\n"
                 "可能原因：视频不存在、地区限制或需要登录\n"
-                "提示：可在插件数据目录放置 bili_cookies.txt 解决鉴权问题"
+                "提示：管理员可私聊 #音乐登录 B站 扫码，或 #音乐Cookie B站 导入登录态"
             ))
             return
 

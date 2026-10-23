@@ -96,6 +96,8 @@ class CredentialStore:
         notices = state.get("notices")
         if not isinstance(accounts, dict) or not isinstance(notices, dict):
             raise CredentialStoreError("Account storage is malformed.")
+        if not isinstance(state.get("bilibili_config_disabled", False), bool):
+            raise CredentialStoreError("Account configuration state is malformed.")
         for provider, account in accounts.items():
             if not isinstance(provider, str) or not isinstance(account, dict):
                 raise CredentialStoreError("Account storage is malformed.")
