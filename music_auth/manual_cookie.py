@@ -123,13 +123,25 @@ def _header(text, selected):
     parts = text.split(";")
     if len(parts) > _MAX_ENTRIES:
         _fail("COOKIE_SIZE")
+    csrf_values = set()
     for part in parts:
         if not part.strip():
             continue
         key, separator, value = part.strip().partition("=")
         if not separator:
             _fail()
-        _add(selected, key.strip(), value.strip(), (0, 0, 0))
+        key, value = _name(key.strip()), value.strip()
+        if key == "__csrf":
+            candidate = {}
+            _add(candidate, key, value, (0, 0, 0))
+            if candidate:
+                csrf_values.add(value)
+        else:
+            _add(selected, key, value, (0, 0, 0))
+    # Header exports lose domain/path metadata; an ambiguous optional CSRF must
+    # not select an arbitrary account scope or invalidate the unique session.
+    if len(csrf_values) == 1:
+        _add(selected, "__csrf", csrf_values.pop(), (0, 0, 0))
 
 
 def _json(text, selected, now):
@@ -149,6 +161,8 @@ def _json(text, selected, now):
         entries = json.loads(text, object_pairs_hook=unique_object)
     except (ValueError, RecursionError):
         _fail()
+    if isinstance(entries, dict) and isinstance(entries.get("cookies"), list):
+        entries = entries["cookies"]
     if not isinstance(entries, list):
         _fail()
     if len(entries) > _MAX_ENTRIES:
@@ -159,6 +173,9 @@ def _json(text, selected, now):
         key, value = entry.get("name"), entry.get("value")
         if not isinstance(key, str) or not isinstance(value, str):
             _fail()
+        key = _name(key)
+        if key not in _AUTH_NAMES:
+            continue
         priority = _scope(entry.get("domain"), entry.get("path"), entry.get("hostOnly"))
         if "session" in entry and type(entry["session"]) is not bool:
             _fail()
@@ -172,10 +189,9 @@ def _netscape(text, selected, now):
     for line in text.splitlines():
         if not line.strip():
             continue
-        if line.startswith("\\#HttpOnly_"):
-            line = line[1:]
-        if line.startswith("#HttpOnly_"):
-            line = line[len("#HttpOnly_") :]
+        http_only = re.match(r"^\\?#HttpOnly\\?_", line)
+        if http_only:
+            line = line[http_only.end() :]
         elif line.startswith("#"):
             continue
         fields = line.split("\t")
@@ -190,6 +206,9 @@ def _netscape(text, selected, now):
             "FALSE",
         }:
             _fail()
+        key = _name(key)
+        if key not in _AUTH_NAMES:
+            continue
         priority = _scope(domain, path, include_subdomains == "FALSE")
         if not re.fullmatch(r"[0-9]{1,16}", expires):
             _fail()

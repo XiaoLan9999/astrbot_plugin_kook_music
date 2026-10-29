@@ -136,14 +136,14 @@ async def smoke():
     logger.addHandler(capture)
     sequence = [0]
 
-    def event_for(text, *, actor="123", private=True, raw_content=None):
+    def event_for(text, *, actor="123", private=True, raw_content=None, kind=9):
         sequence[0] += 1
         wire = {
             "s": 0,
             "sn": sequence[0],
             "d": {
                 "channel_type": "PERSON" if private else "GROUP",
-                "type": 9,
+                "type": kind,
                 "target_id": "900001" if private else "synthetic-channel",
                 "author_id": actor,
                 "content": text,
@@ -152,7 +152,7 @@ async def smoke():
                 "nonce": "synthetic-nonce",
                 "from_type": 1,
                 "extra": {
-                    "type": 9,
+                    "type": kind,
                     "guild_id": None if private else "synthetic-guild",
                     "kmarkdown": {
                         "raw_content": text if raw_content is None else raw_content,
@@ -650,6 +650,95 @@ async def smoke():
                     for message in capture.messages
                 ),
                 "Bilibili cookie values never reach actual Core or plugin logs",
+            )
+
+            variant_markers = (
+                "synthetic-original-httponly-secret",
+                "synthetic-original-header-secret",
+                "synthetic-original-conflict-secret",
+                "synthetic-rendered-conflict-secret",
+            )
+            now[0] += 61
+            await consumed("#音乐Cookie 网易云")
+            original_export = (
+                "# Netscape HTTP Cookie File\n"
+                "#HttpOnly_.music.163.com\tTRUE\t/\tFALSE\t0\tMUSIC_U\t"
+                + variant_markers[0]
+                + "\n.music.163.com\tTRUE\t/\tFALSE\t0\t__csrf\tsynthetic-csrf"
+            )
+            rendered_export = original_export.replace("#HttpOnly_", "#HttpOnly").replace(
+                "MUSIC_U", "MUSICU"
+            )
+            before = len(imports)
+            await consumed(original_export, raw_content=rendered_export)
+            check(
+                len(imports) == before + 1,
+                "original Netscape export survives lossy raw markdown rendering",
+            )
+            check(
+                imports[-1][1]["cookies"].get("MUSIC_U") == variant_markers[0],
+                "original HttpOnly authentication row reaches actual mixin validator",
+            )
+
+            now[0] += 61
+            await consumed("#音乐Cookie 网易云")
+            await consumed(
+                "MUSIC_U=" + variant_markers[1]
+                + "; __csrf=synthetic-parent; __csrf=synthetic-host",
+                raw_content="MUSIC_U=" + variant_markers[1] + "; __csrf=synthetic-host",
+            )
+            check(
+                imports[-1][1]["cookies"] == {"MUSIC_U": variant_markers[1]},
+                "lossy rendered header cannot reintroduce an ambiguous optional csrf",
+            )
+
+            now[0] += 61
+            await consumed("#音乐Cookie 网易云")
+            before = len(imports)
+            await consumed(
+                "MUSIC_U=" + variant_markers[2],
+                raw_content="MUSIC_U=" + variant_markers[3],
+            )
+            check(
+                len(imports) == before,
+                "conflicting valid representations cannot choose a different account",
+            )
+            check(
+                "不一致" in private_send.await_args.args[2]
+                or "冲突" in private_send.await_args.args[2],
+                "representation conflict has a fixed private explanation",
+            )
+
+            now[0] += 61
+            await consumed("#音乐Cookie 网易云")
+            before = len(imports)
+            recalls = deletion.await_count
+            await consumed("https://img.kookapp.cn/assets/synthetic-cookie.json", kind=4)
+            check(len(imports) == before, "file attachment never becomes authentication data")
+            check(
+                deletion.await_count == recalls,
+                "unsupported attachment cannot be mistaken for successful import",
+            )
+            check(
+                "附件" in private_send.await_args.args[2]
+                and "文字" in private_send.await_args.args[2],
+                "real file event receives a specific text-import explanation",
+            )
+            check(
+                not any(
+                    marker in message
+                    for marker in variant_markers
+                    for message in capture.messages
+                ),
+                "Cookie representation variants never reach actual Core logs",
+            )
+            check(
+                not any(
+                    marker in str(call)
+                    for marker in variant_markers
+                    for call in private_send.await_args_list
+                ),
+                "representation replies never echo authentication values",
             )
 
             now[0] += 61

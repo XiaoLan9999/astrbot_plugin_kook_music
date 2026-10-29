@@ -23,6 +23,9 @@ _SECRET = re.compile(
     re.IGNORECASE,
 )
 _MSG_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_COOKIE_TARGET = re.compile(
+    r"(网易云|netease|B站|哔哩哔哩|bilibili|bili)(?:\s+|$)", re.IGNORECASE
+)
 _EXPIRED_BILIBILI_GRACE_SECONDS = 300
 GUIDE = (
     "请先在网易云官网完成登录/安全验证，再私聊发送 #音乐Cookie 网易云，"
@@ -71,6 +74,59 @@ def _secret_text(text):
     return isinstance(value, list) and any(
         isinstance(item, dict) and "name" in item and "value" in item for item in value
     )
+
+
+def _select_cookie_text(provider, text, candidates, *, inline=False):
+    if provider == "netease":
+        from .manual_cookie import parse_netease_cookie as parse
+    else:
+        from .bilibili_cookie import parse_bilibili_cookie as parse
+
+    variants = [text]
+    original = text
+    for index, candidate in enumerate(candidates):
+        if inline:
+            command = _COMMAND.match(candidate)
+            if command is None or command[1].lower() not in {"音乐cookie", "音乐验证"}:
+                continue
+            argument = candidate[command.end() :].strip()
+            target = _COOKIE_TARGET.match(argument)
+            if target is None:
+                continue
+            candidate_provider = (
+                "netease" if target[1].lower() in {"网易云", "netease"} else "bilibili"
+            )
+            if candidate_provider != provider:
+                continue
+            candidate = argument[target.end() :].strip()
+        if index == len(candidates) - 1:
+            original = candidate
+        if candidate not in variants:
+            variants.append(candidate)
+    valid = []
+    for candidate in variants:
+        try:
+            cookies = parse(candidate)["cookies"]
+        except ValueError as error:
+            if candidate == original and getattr(error, "code", "") in {
+                "COOKIE_SCOPE",
+                "COOKIE_CONFLICT",
+                "COOKIE_VALUE",
+                "COOKIE_SIZE",
+            }:
+                return original
+            continue
+        for _, previous in valid:
+            if any(
+                previous[key] != cookies[key]
+                for key in previous.keys() & cookies.keys()
+            ):
+                raise ValueError("Conflicting cookie message representations")
+        valid.append((candidate, cookies))
+    if not valid:
+        return text
+    # The original content is last; never add credentials lost by its parser.
+    return valid[-1][0]
 
 
 class PrivateCookieIntake:
@@ -262,6 +318,8 @@ class PrivateCookieIntake:
                     window,
                     generation,
                     other_import,
+                    candidates=tuple(candidates),
+                    attachment=enum_value(event_field(event, "type")) == 4,
                 )
             )
             self.tasks.add(task)
@@ -290,6 +348,9 @@ class PrivateCookieIntake:
         window,
         generation,
         busy=False,
+        *,
+        candidates=(),
+        attachment=False,
     ):
         try:
             async with asyncio.timeout(60):
@@ -314,6 +375,8 @@ class PrivateCookieIntake:
                     window,
                     generation,
                     busy,
+                    candidates=candidates,
+                    attachment=attachment,
                 )
         except asyncio.CancelledError:
             raise
@@ -341,6 +404,9 @@ class PrivateCookieIntake:
         window,
         generation,
         busy=False,
+        *,
+        candidates=(),
+        attachment=False,
     ):
         owner = self.owner
         manager = await owner._ensure_music_auth()
@@ -368,18 +434,16 @@ class PrivateCookieIntake:
                 name = "音乐Cookie"
             argument = text[command.end() :].strip()
             if name in {"音乐Cookie", "音乐验证"}:
-                match = re.match(
-                    r"(网易云|netease|B站|哔哩哔哩|bilibili|bili)(?:\s+|$)",
-                    argument,
-                    re.IGNORECASE,
-                )
+                match = _COOKIE_TARGET.match(argument)
                 if not match:
                     await owner._notify_music_auth(
                         bot_id, actor, GUIDE + "\n\n" + BILIBILI_GUIDE
                     )
                     return
                 provider = (
-                    "netease" if match[1].lower() in {"网易云", "netease"} else "bilibili"
+                    "netease"
+                    if match[1].lower() in {"网易云", "netease"}
+                    else "bilibili"
                 )
                 if provider == "netease":
                     ok, _ = await manager.prepare_manual_handoff(bot_id, actor)
@@ -414,7 +478,8 @@ class PrivateCookieIntake:
                     await owner._notify_music_auth(
                         bot_id,
                         actor,
-                        f"已开启 {ttl} 秒一次性接收窗口。\n" + _provider_guide(provider),
+                        f"已开启 {ttl} 秒一次性接收窗口。\n"
+                        + _provider_guide(provider),
                     )
                     return
                 text = payload
@@ -440,6 +505,24 @@ class PrivateCookieIntake:
             )
             return
         if not current():
+            return
+        if attachment:
+            await owner._notify_music_auth(
+                bot_id,
+                actor,
+                "收到的是文件附件，此入口只接收 Cookie 文字，不会下载附件。请重新开启接收窗口后粘贴 Header String；JSON 过长时可仅保留认证字段。",
+            )
+            return
+        try:
+            text = _select_cookie_text(
+                provider, text, candidates, inline=command is not None
+            )
+        except ValueError:
+            await owner._notify_music_auth(
+                bot_id,
+                actor,
+                "消息原文与格式化文本中的账号字段不一致，原账号未更改。请重新开启窗口并用代码块发送 Cookie。",
+            )
             return
         operation = (actor, object())
         self.import_owner = operation

@@ -156,6 +156,42 @@ class CookieExportTests(unittest.TestCase):
     def test_header_duplicate_different_value_rejects(self):
         self.rejected("MUSIC_U=synthetic-session;MUSIC_U=different", "COOKIE_CONFLICT")
 
+    def test_header_conflicting_optional_csrf_is_omitted_without_guessing(self):
+        for values in (
+            ("first", "second"),
+            ("second", "first"),
+            ("first", "second", "first"),
+        ):
+            with self.subTest(order=values):
+                text = "MUSIC_U=synthetic-session;" + ";".join(
+                    "__csrf=" + value for value in values
+                )
+                self.assertEqual(self.parsed(text), {"MUSIC_U": "synthetic-session"})
+
+    def test_header_identical_csrf_is_retained_and_empty_value_ignored(self):
+        self.assertEqual(
+            self.parsed(
+                "MUSIC_U=synthetic-session;__csrf=;__csrf=csrf;\\_\\_csrf=csrf"
+            ),
+            {"MUSIC_U": "synthetic-session", "__csrf": "csrf"},
+        )
+
+    def test_header_optional_csrf_ambiguity_does_not_hide_invalid_values(self):
+        self.rejected(
+            "MUSIC_U=synthetic-session;__csrf=valid;__csrf=bad,value", "COOKIE_VALUE"
+        )
+        self.rejected(
+            "MUSIC_U=synthetic-session;__csrf=first;__csrf=second\r\nX-Injected=x"
+        )
+
+    def test_header_other_authentication_conflicts_remain_rejected(self):
+        for name in ("MUSIC_U", "MUSIC_A", "MUSIC_R_T"):
+            with self.subTest(name=name):
+                self.rejected(
+                    "MUSIC_U=synthetic-session;" + name + "=first;" + name + "=second",
+                    "COOKIE_CONFLICT",
+                )
+
     def test_json_duplicate_same_value_merges(self):
         self.assertEqual(
             self.parsed(json.dumps([cookie(), cookie()])),
@@ -165,6 +201,60 @@ class CookieExportTests(unittest.TestCase):
     def test_json_duplicate_different_value_rejects(self):
         self.rejected(
             json.dumps([cookie(), cookie(value="different")]), "COOKIE_CONFLICT"
+        )
+
+    def test_json_cookie_list_wrapper_preserves_only_authentication_fields(self):
+        self.assertEqual(
+            self.parsed(
+                json.dumps(
+                    {
+                        "cookies": [cookie(), cookie("__csrf", "csrf")],
+                        "exporter": "synthetic",
+                    }
+                )
+            ),
+            {"MUSIC_U": "synthetic-session", "__csrf": "csrf"},
+        )
+        for value in (None, {}, "not-a-list"):
+            self.rejected(json.dumps({"cookies": value}))
+        self.rejected('{"cookies": [], "cookies": []}')
+
+    def test_json_and_netscape_preserve_csrf_scope_selection_and_conflicts(self):
+        self.assertEqual(
+            self.parsed(
+                json.dumps(
+                    [
+                        cookie(),
+                        cookie("__csrf", "parent", domain=".163.com"),
+                        cookie("__csrf", "specific"),
+                    ]
+                )
+            ),
+            {"MUSIC_U": "synthetic-session", "__csrf": "specific"},
+        )
+        self.assertEqual(
+            self.parsed(
+                "\n".join(
+                    [
+                        netscape(),
+                        netscape("__csrf", "parent", domain=".163.com"),
+                        netscape("__csrf", "specific"),
+                    ]
+                )
+            ),
+            {"MUSIC_U": "synthetic-session", "__csrf": "specific"},
+        )
+        self.rejected(
+            json.dumps(
+                [cookie(), cookie("__csrf", "first"), cookie("__csrf", "second")]
+            ),
+            "COOKIE_CONFLICT",
+        )
+        self.rejected(
+            "\n".join(
+                [netscape(), netscape("__csrf", "first"), netscape("__csrf", "second")]
+            ),
+            "COOKIE_CONFLICT",
         )
 
     def test_json_more_specific_domain_wins_in_both_orders(self):
@@ -296,6 +386,57 @@ class CookieExportTests(unittest.TestCase):
             {"MUSIC_U": "synthetic-session"},
         )
 
+    def test_unrelated_statistics_scope_cannot_reject_valid_authentication(self):
+        self.assertEqual(
+            self.parsed(
+                json.dumps(
+                    [
+                        cookie(),
+                        cookie(
+                            "statistics",
+                            "opaque",
+                            domain="stats.example",
+                            path="/metrics",
+                        ),
+                        cookie(
+                            "other_statistics",
+                            "opaque",
+                            domain="sub.music.163.com",
+                            path="/vip",
+                        ),
+                    ]
+                )
+            ),
+            {"MUSIC_U": "synthetic-session"},
+        )
+        self.assertEqual(
+            self.parsed(
+                "\n".join(
+                    [
+                        netscape(),
+                        netscape(
+                            "statistics",
+                            "opaque",
+                            domain="stats.example",
+                            path="/metrics",
+                        ),
+                        netscape("other_statistics", "opaque", path="/vip"),
+                    ]
+                )
+            ),
+            {"MUSIC_U": "synthetic-session"},
+        )
+
+    def test_ignored_statistics_do_not_relax_authentication_scope(self):
+        self.rejected(
+            json.dumps([cookie(), cookie("__csrf", "wrong", domain="stats.example")]),
+            "COOKIE_SCOPE",
+        )
+        self.rejected(
+            netscape() + "\n" + netscape("__csrf", "wrong", domain="stats.example"),
+            "COOKIE_SCOPE",
+        )
+
     def test_netscape_http_only_and_comment_lines(self):
         self.assertEqual(
             self.parsed(
@@ -309,6 +450,17 @@ class CookieExportTests(unittest.TestCase):
         self.assertEqual(
             self.parsed("\\#HttpOnly_" + netscape(name=r"MUSIC\_U")),
             {"MUSIC_U": "synthetic-session"},
+        )
+
+    def test_netscape_known_http_only_prefix_markdown_escaping_preserves_token(self):
+        for prefix in ("#HttpOnly_", "\\#HttpOnly_", "#HttpOnly\\_", "\\#HttpOnly\\_"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    self.parsed(prefix + netscape(value="synthetic%2B%3D%5F")),
+                    {"MUSIC_U": "synthetic%2B%3D%5F"},
+                )
+        self.rejected(
+            "#HttpOnly\\_" + netscape(value=r"synthetic\_session"), "COOKIE_VALUE"
         )
 
     def test_netscape_session_zero_and_crlf(self):
