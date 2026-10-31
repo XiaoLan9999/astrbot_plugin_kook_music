@@ -68,7 +68,7 @@ async def smoke():
         KookWebsocketEvent,
     )
     from astrbot.core.utils.metrics import Metric
-    from astrbot_plugin_kook_music import card_builder, kook_api
+    from astrbot_plugin_kook_music import card_builder, kook_api, main as main_module
     from astrbot_plugin_kook_music.card_ledger import CardLedger
     from astrbot_plugin_kook_music.kook_events import KookEventBridge
     from astrbot_plugin_kook_music.main import KookMusicPlugin
@@ -130,6 +130,7 @@ async def smoke():
         target="synthetic-channel",
         message_id="synthetic-receipt",
         system=None,
+        system_type="deleted_message",
     ):
         nonlocal sequence
         sequence += 1
@@ -145,7 +146,7 @@ async def smoke():
             }
         elif message_type == 255:
             extra = {
-                "type": "deleted_message",
+                "type": system_type,
                 "body": system or {"msg_id": message_id},
             }
         wire = {
@@ -398,6 +399,82 @@ async def smoke():
                 plugin._card_msg_ids["synthetic-guild"] == ["new-playing-card"],
                 "deletion receipt preserves replacement IDs",
             )
+            session.playback_generation = 7
+            song.duration = 8000
+            playing_card = card_builder.build_now_playing_card(song)
+            values = {
+                element.get("value")
+                for part in playing_card["modules"]
+                for element in part.get("elements", [])
+                if element.get("type") == "button"
+            }
+            check(
+                {"kook_music_back_15", "kook_music_forward_30"} <= values,
+                "generated playing card contains both seek controls",
+            )
+
+            async def button(value, actor="123", message_id="new-playing-card"):
+                await dispatch(event_for(
+                    "", message_type=255, message_id="synthetic-button-event",
+                    system_type="message_btn_click", system={
+                        "value": value, "user_id": actor,
+                        "target_id": "synthetic-channel", "msg_id": message_id,
+                    },
+                ))
+
+            control = AsyncMock(return_value=(True, "synthetic seek"))
+            plugin.voice_manager.control = control
+            with (
+                patch.object(main_module, "send_text_message", AsyncMock()),
+                patch.object(main_module, "is_guild_admin", AsyncMock(return_value=False)) as admin_check,
+            ):
+                await button("kook_music_forward_30")
+                captured = plugin._button_click_queue.get_nowait()
+                check(captured["expected_song"] is song, "gateway pins seek song identity")
+                check(captured["expected_generation"] == 7, "gateway pins seek generation at receipt")
+                session.playback_generation = 8
+                await plugin._handle_button_click(captured)
+                check(control.await_count == 0, "queued old-generation seek never reaches manager")
+
+                await button("kook_music_forward_30")
+                await plugin._handle_button_click(plugin._button_click_queue.get_nowait())
+                check(control.await_count == 1, "fresh seek button reaches shared manager control")
+                args, kwargs = control.await_args
+                check(args == ("synthetic-guild", "seek"), "seek route retains guild scope")
+                check(kwargs["relative_seconds"] == 30, "forward button retains positive delta")
+                check(kwargs["actor_id"] == "123", "seek retains original actor")
+                check(kwargs["expected_session"] is session, "seek pins session identity")
+                check(kwargs["expected_song"] is song, "seek pins current song through permission boundary")
+                check(kwargs["expected_generation"] == 8, "seek retains fresh generation through permission boundary")
+                check(not admin_check.await_count, "requester seek does not require admin lookup")
+
+                plugin._card_ledger.records["new-playing-card"]["pending"] = False
+                await button("kook_music_back_15", actor="456")
+                await plugin._handle_button_click(plugin._button_click_queue.get_nowait())
+                check(control.await_count == 1, "unrelated user cannot seek through real gateway")
+                check(admin_check.await_count == 1, "non-owner authorization checks guild admin")
+                admin_check.return_value = True
+                await button("kook_music_back_15", actor="456")
+                await plugin._handle_button_click(plugin._button_click_queue.get_nowait())
+                check(control.await_count == 2, "guild admin may seek through real gateway")
+                check(control.await_args.kwargs["relative_seconds"] == -15, "backward button retains negative delta")
+                check(control.await_args.kwargs["is_admin"] is True, "admin approval reaches atomic manager check")
+
+                plugin._card_ledger.records["new-playing-card"]["pending"] = False
+                session.seek_cooldown_until = main_module.time.monotonic() + 5
+                await button("kook_music_forward_30")
+                delayed = plugin._button_click_queue.get_nowait()
+                check(delayed["seek_blocked_on_receipt"], "gateway rejects clicks made during cooldown")
+                session.seek_cooldown_until = 0
+                await plugin._handle_button_click(delayed)
+                check(control.await_count == 2, "expired cooldown cannot revive previously queued clicks")
+
+                plugin._retire_card_ids(["new-playing-card"])
+                await button("kook_music_forward_30")
+                await plugin._handle_button_click(plugin._button_click_queue.get_nowait())
+                check(control.await_count == 2, "retired card cannot seek while deletion is pending")
+                check(queue.empty(), "seek system events never enter user message queue")
+
             wrong = event_for(
                 "",
                 message_type=255,

@@ -7,6 +7,7 @@ AstrBot KOOK 语音点歌插件。
 
 import asyncio
 import copy
+import math
 import time
 from contextvars import ContextVar
 from contextlib import aclosing
@@ -32,6 +33,7 @@ from .music.downloader import MusicDownloader
 from .music.model import Song
 from .music.searcher import MusicSearcher
 from .music.link_router import resolve_music_link
+from .music.playback_time import parse_playback_time
 from .music.bilibili import BilibiliCollection, BilibiliExtractor
 from .music.playlist_import import PlaylistImporter
 from .playlist_range import looks_like_playlist_range, validate_playlist_range
@@ -87,6 +89,9 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
         self.volume = self._parse_volume(self.config.get("volume", "0.15"))
         self.streaming_mode = self.config.get("streaming_mode", "relay")
         self.prefetch_next = self.config.get("prefetch_next", True) is not False
+        self.seek_cooldown_seconds = self._parse_int_range(
+            self.config.get("seek_cooldown_seconds", 5), 5, 1, 60
+        )
         self.bili_stream_threshold_minutes = self._parse_int_range(
             self.config.get("bili_stream_threshold_minutes", 30),
             30,
@@ -140,6 +145,7 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             streaming_mode=self.streaming_mode,
             max_queue_size=self.max_queue_size,
             prefetch_next=self.prefetch_next,
+            seek_cooldown_seconds=self.seek_cooldown_seconds,
             stream_startup_buffer_seconds=self.stream_startup_buffer_seconds,
             stream_max_buffer_seconds=self.stream_max_buffer_seconds,
             stream_rebuffer_seconds=self.stream_rebuffer_seconds,
@@ -318,15 +324,32 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             return
         if event_type == "message_btn_click":
             value = event_field(body, "value", "")
-            if value not in ("kook_music_next", "kook_music_loop", "kook_music_clear", "kook_music_stop"):
+            if value not in (
+                "kook_music_next", "kook_music_loop", "kook_music_clear", "kook_music_stop",
+                "kook_music_back_15", "kook_music_forward_30",
+            ):
                 return
-            self._button_click_queue.put_nowait({
+            click = {
                 "value": value,
                 "msg_id": str(event_field(body, "msg_id", "") or ""),
                 "channel_id": str(event_field(body, "target_id", "") or ""),
                 "user_id": str(event_field(body, "user_id", "") or ""),
                 "token": token,
-            })
+            }
+            if value in {"kook_music_back_15", "kook_music_forward_30"}:
+                guild = self._resolve_button_guild_id(click["msg_id"], click["channel_id"])
+                session = self.voice_manager.sessions.get(guild)
+                if session is None or click["msg_id"] not in self._card_msg_ids.get(guild, []):
+                    return
+                click["expected_song"] = session.current_song
+                click["expected_generation"] = session.playback_generation
+                click["seek_blocked_on_receipt"] = bool(
+                    session.pending_skips > 0
+                    or getattr(session, "seek_in_progress", False)
+                    or not getattr(session, "playback_ready", True)
+                    or getattr(session, "seek_cooldown_until", 0.0) > time.monotonic()
+                )
+            self._button_click_queue.put_nowait(click)
         elif event_type in ("exited_channel", "joined_channel"):
             bot_id = str(getattr(client, "bot_id", "") or "")
             if not bot_id or str(event_field(body, "user_id", "")) != bot_id:
@@ -407,12 +430,26 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             "kook_music_loop": "loop",
             "kook_music_clear": "clear",
             "kook_music_stop": "stop",
+            "kook_music_back_15": "seek",
+            "kook_music_forward_30": "seek",
         }.get(value)
         if not action:
             return
+        if action == "seek" and click_data.get("seek_blocked_on_receipt"):
+            await send_text_message(token, channel_id, "❌ 点击时仍在冷却或切换中，请稍后重新操作")
+            return
+        options = {}
+        if action == "seek":
+            ledger = getattr(self, "_card_ledger", None)
+            record = ledger.records.get(msg_id) if ledger is not None else None
+            if msg_id not in self._card_msg_ids.get(guild_id, []) or record and record["pending"]:
+                return
+            options["relative_seconds"] = -15 if value == "kook_music_back_15" else 30
+            options["expected_song"] = click_data.get("expected_song", session.current_song)
+            options["expected_generation"] = click_data.get("expected_generation", session.playback_generation)
         ok, msg = await self._control_playback(
             guild_id, click_data.get("user_id", ""), action,
-            expected_session=session,
+            expected_session=session, **options,
         )
         reply = f"{'✅' if ok else '❌'} {msg}"
         if channel_id:
@@ -422,6 +459,9 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
         self, guild_id: str, user_id: str, action: str,
         *, expected_session=None, position: int | None = None,
         destination: int | None = None,
+        target_seconds: float | None = None,
+        relative_seconds: float | None = None,
+        expected_song: Song | None = None, expected_generation: int | None = None,
     ) -> tuple[bool, str]:
         user_id = str(user_id or "").strip()
         if not user_id:
@@ -435,6 +475,12 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
         if edit and (type(position) is not int or not 2 <= position <= len(session.playlist)):
             return False, "请使用当前歌单中的待播序号（第 1 首不可编辑）"
         song = session.playlist[position - 1] if edit else VoiceManager.control_song(session)
+        generation = getattr(session, "playback_generation", 0)
+        if action == "seek" and (
+            expected_song is not None and song is not expected_song
+            or expected_generation is not None and generation != expected_generation
+        ):
+            return False, "播放进度已变化，请使用最新卡片重试"
         requester_id = str(song.requester_id or "") if song is not None else ""
         admin = False
         if user_id != requester_id:
@@ -445,11 +491,16 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
         # an earlier skip may have moved playback to a different user's song.
         old_cards = list(self._card_msg_ids.get(guild_id, []))
         options = {"destination": destination} if destination is not None else {}
+        if action == "seek":
+            options.update(
+                target_seconds=target_seconds, relative_seconds=relative_seconds,
+                expected_song=song, expected_generation=generation,
+            )
         result = await self.voice_manager.control(
             guild_id, action, actor_id=user_id, is_admin=admin,
             expected_session=session, position=position, **options,
         )
-        if result[0] and action in {"next", "stop", "leave"}:
+        if result[0] and action in {"next", "stop", "leave", "seek"}:
             self._retire_card_ids(old_cards)
         return result
 
@@ -886,6 +937,27 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             session.playlist, session.loop_mode_name, page=page
         )
         yield event.chain_result([Json(data=card_data)])
+
+    @filter.command("跳转")
+    async def on_seek(self, event: AstrMessageEvent):
+        """跳转当前歌曲到指定播放时间。"""
+        if not self._is_kook(event):
+            return
+        parts = str(getattr(event, "message_str", "")).split()
+        if parts and parts[0].lstrip("#/") == "跳转":
+            parts = parts[1:]
+        try:
+            if len(parts) != 1:
+                raise ValueError("TIME_FORMAT")
+            target = parse_playback_time(parts[0])
+        except ValueError:
+            yield event.plain_result("用法：#跳转 90、#跳转 1:30 或 #跳转 1:02:30；分秒须小于 60")
+            return
+        ok, msg = await self._control_playback(
+            self._get_guild_id(event), event.get_sender_id(), "seek",
+            target_seconds=target,
+        )
+        yield event.plain_result(f"{'✅' if ok else '❌'} {msg}")
 
     async def _edit_queue_command(self, event, command, action, count):
         if not self._is_kook(event):
@@ -1410,11 +1482,13 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
     ) -> str | None:
         """发送卡片并记录 msg_id（先删旧卡片再发新卡片）"""
         operation_token = self._kook_token
+        operation_generation = getattr(expected_session, "playback_generation", 0)
         def still_current():
             return self._kook_token == operation_token and (expected_session is None or (
                 self.voice_manager.sessions.get(guild_id) is expected_session
                 and expected_session.current_song is expected_song
                 and expected_session.is_playing
+                and getattr(expected_session, "playback_generation", 0) == operation_generation
             ))
 
         lock = self._card_locks.setdefault(guild_id, asyncio.Lock())
@@ -1434,6 +1508,14 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             started_at = getattr(expected_session, "playback_started_at", 0.0)
             if started_at and expected_song is not None and expected_song.duration > 0:
                 elapsed = max(0.0, time.monotonic() - started_at)
+                media_elapsed = getattr(
+                    getattr(expected_session, "ffmpeg_player", None), "played_seconds", None
+                )
+                if (
+                    type(media_elapsed) in (int, float)
+                    and math.isfinite(media_elapsed) and media_elapsed >= 0
+                ):
+                    elapsed = media_elapsed
                 elapsed += getattr(expected_session, "playback_offset_seconds", 0.0)
                 remaining_ms = max(1000, expected_song.duration - int(elapsed * 1000))
                 card_data = copy.deepcopy(card_data)
@@ -1450,15 +1532,26 @@ class KookMusicPlugin(CardCleanupMixin, MusicAuthMixin, Star):
             except asyncio.CancelledError:
                 # The server may have accepted the POST; recover its ID before
                 # cleanup instead of abandoning an untracked "playing" card.
-                try:
-                    msg_id = await send_task
-                except Exception:
-                    msg_id = None
-                if msg_id:
-                    self._ledger_write("track", guild_id, channel_id, operation_token, msg_id, pending=True)
-                    failed_msg_ids.extend(await self._delete_card_messages([msg_id]))
-                    if failed_msg_ids:
-                        self._card_msg_ids[guild_id] = failed_msg_ids
+                async def recover_cancelled_send():
+                    try:
+                        accepted_id = await send_task
+                    except Exception:
+                        accepted_id = None
+                    if accepted_id:
+                        self._ledger_write("track", guild_id, channel_id, operation_token, accepted_id, pending=True)
+                        failed_msg_ids.extend(await self._delete_card_messages([accepted_id]))
+                        if failed_msg_ids:
+                            self._card_msg_ids[guild_id] = failed_msg_ids
+
+                cleanup_task = asyncio.create_task(recover_cancelled_send())
+                while not cleanup_task.done():
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        # A subsequent seek/stop/unload must not interrupt receipt
+                        # recovery that was already started by the first cancel.
+                        continue
+                cleanup_task.result()
                 raise
             if msg_id:
                 self._ledger_write("track", guild_id, channel_id, operation_token, msg_id, pending=not still_current())

@@ -132,6 +132,37 @@ class BilibiliInputParsingTests(unittest.TestCase):
         )
 
 
+class BilibiliCoverTests(unittest.TestCase):
+    def test_uploaded_cover_wins_over_a_dark_first_frame_for_all_parts(self):
+        view = make_view(2)
+        for page in view["pages"]:
+            page["first_frame"] = "https://images.example.test/dark-first-frame.jpg"
+        extractor = BilibiliExtractor()
+        for page in (1, 2):
+            with self.subTest(page=page):
+                song = extractor._song_from_view(view, page)
+                self.assertEqual(
+                    song.cover_url, "https://images.example.test/cover.jpg"
+                )
+
+    def test_first_frame_is_used_only_when_uploaded_cover_is_missing_or_invalid(self):
+        extractor = BilibiliExtractor()
+        for cover in ("", None, "not-a-url"):
+            with self.subTest(cover=cover):
+                view = make_view(1)
+                view["pic"] = cover
+                view["pages"][0]["first_frame"] = "//images.example.test/frame.jpg"
+                self.assertEqual(
+                    extractor._song_from_view(view, 1).cover_url,
+                    "https://images.example.test/frame.jpg",
+                )
+
+    def test_absent_cover_and_frame_leave_empty_cover(self):
+        view = make_view(1)
+        view.pop("pic")
+        self.assertEqual(BilibiliExtractor()._song_from_view(view, 1).cover_url, "")
+
+
 class BilibiliCollectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_official_short_link_is_expanded_with_redirect_allowlist(self):
         class FakeResponse:
@@ -576,6 +607,8 @@ class BilibiliYtDlpOptionTests(unittest.TestCase):
         self.assertEqual(output, "output-base.m4a")
         self.assertEqual(len(created_options), 2)
         self.assertTrue(all(options["noplaylist"] for options in created_options))
+        self.assertNotIn("http_chunk_size", created_options[0])
+        self.assertEqual(created_options[1]["http_chunk_size"], 1024 * 1024)
         self.assertEqual(
             extract_calls,
             [

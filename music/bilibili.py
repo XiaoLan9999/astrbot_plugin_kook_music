@@ -566,7 +566,9 @@ class BilibiliExtractor:
         name = f"{title} - {part}" if len(pages) > 1 else title
         owner = view.get("owner") if isinstance(view.get("owner"), dict) else {}
         duration = max(0, self._safe_int(page_info.get("duration"), 0)) * 1000
-        cover_url = self._https_url(page_info.get("first_frame") or view.get("pic"))
+        cover_url = self._https_url(view.get("pic")) or self._https_url(
+            page_info.get("first_frame")
+        )
         return Song(
             id=bvid if len(pages) == 1 and page == 1 else f"{bvid}_p{page}",
             name=name,
@@ -1196,7 +1198,7 @@ class BilibiliExtractor:
                     f"{Path(result_path).name}"
                 )
             else:
-                logger.error(f"[KookMusic] B站音频下载失败: 文件不存在")
+                logger.error("[KookMusic] B站音频下载失败: 文件不存在")
         except asyncio.CancelledError:
             # to_thread 无法强制停止；让后台下载完成后删除这一批无人引用的文件。
             download_task.add_done_callback(
@@ -1234,6 +1236,8 @@ class BilibiliExtractor:
                 "format": self.AUDIO_FORMAT,
                 "outtmpl": output_base + ".%(ext)s",
                 "noplaylist": True,
+                # Some Bilibili CDNs reject a full GET (HTTP 567) but allow Range.
+                "http_chunk_size": 1024 * 1024,
             }
         )
 

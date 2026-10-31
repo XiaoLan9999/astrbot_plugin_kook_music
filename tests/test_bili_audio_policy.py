@@ -1,6 +1,8 @@
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -221,6 +223,90 @@ class BiliAudioFormatTests(unittest.TestCase):
             self.assertEqual(stream, {})
             self.assertEqual(output, "")
             self.assertFalse(artifact.exists())
+
+    def test_download_chunks_work_with_a_cdn_that_rejects_non_range_requests(self):
+        payload = bytes(range(256)) * 10000
+        ranges = []
+
+        class RangeOnlyHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                value = self.headers.get("Range", "")
+                ranges.append(value)
+                if not value.startswith("bytes="):
+                    self.send_error(567)
+                    return
+                start, end = value[6:].split("-", 1)
+                start = int(start)
+                end = min(int(end) if end else len(payload) - 1, len(payload) - 1)
+                body = payload[start:end + 1]
+                self.send_response(206)
+                self.send_header("Content-Type", "audio/mp4")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(payload)}")
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RangeOnlyHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        extractor = BilibiliExtractor()
+        real_ydl = bilibili_module.yt_dlp.YoutubeDL
+        source = f"http://127.0.0.1:{server.server_port}/audio.m4a"
+
+        class SeededYoutubeDL:
+            def __init__(self, options):
+                self.ydl = real_ydl({**options, "noprogress": True, "logger": Mock()})
+
+            def __enter__(self):
+                self.ydl.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.ydl.__exit__(*args)
+
+            def extract_info(self, url, download):
+                return self.ydl.process_ie_result(
+                    {
+                        "id": BVID,
+                        "title": "Synthetic range audio",
+                        "url": source,
+                        "ext": "m4a",
+                        "vcodec": "none",
+                        "acodec": "aac",
+                    },
+                    download=download,
+                )
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                output_base = str(Path(temp_dir) / "range-audio")
+                with patch.object(
+                    extractor,
+                    "_create_ydl",
+                    lambda options: SeededYoutubeDL(
+                        {**options, "http_chunk_size": 0, "retries": 0}
+                    ),
+                ), self.assertRaises(bilibili_module.yt_dlp.utils.DownloadError):
+                    extractor._yt_download_audio(
+                        f"https://www.bilibili.com/video/{BVID}",
+                        str(Path(temp_dir) / "non-range-audio"),
+                    )
+                self.assertEqual(ranges, [""])
+                ranges.clear()
+                with patch.object(extractor, "_create_ydl", SeededYoutubeDL):
+                    output = extractor._yt_download_audio(
+                        f"https://www.bilibili.com/video/{BVID}", output_base
+                    )
+                self.assertEqual(Path(output).read_bytes(), payload)
+            self.assertGreaterEqual(len(ranges), 3)
+            self.assertTrue(all(value.startswith("bytes=") for value in ranges))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

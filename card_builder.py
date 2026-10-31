@@ -39,6 +39,30 @@ def _append_watermark(modules: list[dict]):
     })
 
 
+def _append_seek_controls(modules: list[dict], song: Song):
+    if song.duration <= 0:
+        return
+    modules.append({
+        "type": "context",
+        "elements": [{"type": "plain-text", "content": "指定时间：#跳转 1:30（仅点歌者/管理员，操作有冷却）"}],
+    })
+    modules.append({
+        "type": "action-group",
+        "elements": [
+            {
+                "type": "button", "theme": "secondary",
+                "text": {"type": "plain-text", "content": "快退 15 秒"},
+                "value": "kook_music_back_15", "click": "return-val",
+            },
+            {
+                "type": "button", "theme": "secondary",
+                "text": {"type": "plain-text", "content": "快进 30 秒"},
+                "value": "kook_music_forward_30", "click": "return-val",
+            },
+        ],
+    })
+
+
 def _normalize_duration_ms(duration: int) -> int:
     """返回毫秒时长，兼容少量来源返回秒数的情况。"""
     try:
@@ -174,6 +198,7 @@ def build_now_playing_card(
         ]
     })
 
+    _append_seek_controls(modules, song)
     card = {
         "type": "card",
         "theme": "secondary",
@@ -587,6 +612,7 @@ def build_bilibili_playing_card(
         ]
     })
 
+    _append_seek_controls(modules, song)
     card = {
         "type": "card",
         "theme": "secondary",

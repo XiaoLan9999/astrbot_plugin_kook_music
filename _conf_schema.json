@@ -105,6 +105,13 @@
         ],
         "default": "relay"
     },
+    "seek_cooldown_seconds": {
+        "description": "播放时间跳转冷却（秒）",
+        "hint": "跳转命令和快进/快退按钮共用每个服务器的冷却，默认 5 秒；仅当前点歌者或管理员可用，不改变连续切歌逻辑。",
+        "type": "int",
+        "slider": {"min": 1, "max": 60, "step": 1},
+        "default": 5
+    },
     "prefetch_next": {
         "description": "预准备下一首歌曲",
         "hint": "播放当前歌曲时，后台最多提前准备下一首普通歌曲，降低切歌等待；不会批量下载歌单。B站视频仍在轮到时即时准备，单曲循环和随机模式不预准备。",

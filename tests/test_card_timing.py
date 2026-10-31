@@ -57,6 +57,30 @@ class CardTimingTests(unittest.IsolatedAsyncioTestCase):
         plugin._delete_card_messages.assert_awaited_with(["late"])
         self.assertNotIn("guild", plugin._card_msg_ids)
 
+    async def test_same_song_seek_invalidates_inflight_card(self):
+        plugin, session, song = self.make_plugin()
+        session.playback_generation = 1
+
+        async def send(*args):
+            session.playback_generation = 2
+            return "old-progress-card"
+
+        with patch.object(main_module, "send_card_message", side_effect=send):
+            self.assertIsNone(await plugin._send_card("text", "guild", {}, session, song))
+        plugin._delete_card_messages.assert_awaited_with(["old-progress-card"])
+        self.assertNotIn("guild", plugin._card_msg_ids)
+
+    async def test_countdown_uses_media_time_not_buffering_wallclock(self):
+        plugin, session, song = self.make_plugin()
+        session.ffmpeg_player = NS(played_seconds=10.0)
+        card = {"modules": [{"type": "countdown"}]}
+        sender = AsyncMock(return_value="new")
+        fake_time = NS(monotonic=lambda: 140.0, time=lambda: 1000.0)
+        with patch.object(main_module, "send_card_message", sender), patch.object(main_module, "time", fake_time):
+            await plugin._send_card("text", "guild", card, session, song)
+        countdown = sender.await_args.args[2]["modules"][0]
+        self.assertEqual(countdown["endTime"] - countdown["startTime"], 85000)
+
     async def test_cancellation_recovers_http_result_and_cleans_accepted_card(self):
         plugin, session, song = self.make_plugin()
         started = asyncio.Event()
@@ -95,6 +119,65 @@ class CardTimingTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main_module, "send_card_message", side_effect=send):
             self.assertIsNone(await plugin._send_card("text", "guild", {}, session, song))
         self.assertEqual(plugin._card_msg_ids["guild"], ["late"])
+
+    async def test_repeated_cancellation_cannot_interrupt_receipt_recovery(self):
+        plugin, session, song = self.make_plugin()
+        entered, release = asyncio.Event(), asyncio.Event()
+        interrupted = asyncio.Event()
+
+        async def send(*args):
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                interrupted.set()
+                raise
+            return "accepted-after-seek-stop"
+
+        with patch.object(main_module, "send_card_message", side_effect=send):
+            task = asyncio.create_task(plugin._send_card("text", "guild", {}, session, song))
+            await entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(interrupted.is_set())
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+        plugin._delete_card_messages.assert_awaited_with(["accepted-after-seek-stop"])
+
+    async def test_repeated_cancellation_cannot_interrupt_accepted_card_delete(self):
+        plugin, session, song = self.make_plugin()
+        entered, release, delete_entered, delete_release = [asyncio.Event() for _ in range(4)]
+
+        async def send(*args):
+            entered.set()
+            await release.wait()
+            return "accepted-before-cleanup"
+
+        async def delete(ids):
+            if not ids:
+                return []
+            delete_entered.set()
+            await delete_release.wait()
+            return []
+
+        plugin._delete_card_messages.side_effect = delete
+        with patch.object(main_module, "send_card_message", side_effect=send):
+            task = asyncio.create_task(plugin._send_card("text", "guild", {}, session, song))
+            await entered.wait()
+            task.cancel()
+            release.set()
+            await delete_entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            delete_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+        self.assertNotIn("guild", plugin._card_msg_ids)
 
     async def test_cancelled_old_card_delete_does_not_lose_tracked_ids(self):
         plugin, session, song = self.make_plugin()

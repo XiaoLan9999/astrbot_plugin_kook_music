@@ -64,6 +64,9 @@ class GuildSession:
     playback_retry_count: int = 0
     playback_started_at: float = 0.0
     playback_offset_seconds: float = 0.0
+    playback_ready: bool = False
+    seek_in_progress: bool = False
+    seek_cooldown_until: float = 0.0
     preparation_task: asyncio.Task | None = field(default=None, repr=False)
     prefetch: SongPrefetch | None = field(default=None, repr=False)
     prefetch_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
@@ -117,6 +120,7 @@ class VoiceManager:
         stream_startup_buffer_seconds: int = 15,
         stream_max_buffer_seconds: int = 120,
         stream_rebuffer_seconds: int = 5,
+        seek_cooldown_seconds: int = 5,
     ):
         self.max_sessions = max_sessions
         self.auto_leave_timeout = auto_leave_timeout
@@ -128,6 +132,7 @@ class VoiceManager:
         self.stream_startup_buffer_seconds = stream_startup_buffer_seconds
         self.stream_max_buffer_seconds = stream_max_buffer_seconds
         self.stream_rebuffer_seconds = stream_rebuffer_seconds
+        self.seek_cooldown_seconds = max(1, min(60, int(seek_cooldown_seconds)))
         self.sessions: dict[str, GuildSession] = {}
         self._pending_sessions: dict[str, GuildSession] = {}
         self._initialization_tasks: dict[str, asyncio.Task] = {}
@@ -187,8 +192,15 @@ class VoiceManager:
         expected_session: GuildSession | None = None,
         position: int | None = None,
         destination: int | None = None,
+        target_seconds: float | None = None,
+        relative_seconds: float | None = None,
+        expected_song: Song | None = None,
+        expected_generation: int | None = None,
     ) -> tuple[bool, str]:
         """在执行前原子检查当前点歌者，供按钮及文字命令共用。"""
+        pending_session = self.sessions.get(guild_id)
+        if action == "seek" and pending_session and pending_session.seek_in_progress:
+            return False, "正在跳转，请稍后再操作"
         lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
         async with lock:
             session = self.sessions.get(guild_id)
@@ -196,6 +208,14 @@ class VoiceManager:
                 return False, "Bot 不在语音频道中"
             if expected_session is not None and session is not expected_session:
                 return False, "播放会话已变化，请重新操作"
+            if action == "seek" and (
+                (expected_song is not None and session.current_song is not expected_song)
+                or (
+                    expected_generation is not None
+                    and session.playback_generation != expected_generation
+                )
+            ):
+                return False, "播放歌曲或进度已变化，请重新操作"
             actor_id = str(actor_id or "").strip()
             if not actor_id:
                 return False, "无法确认操作用户，已拒绝操作"
@@ -231,6 +251,11 @@ class VoiceManager:
                 return await self.clear_playlist(guild_id)
             if action == "stop":
                 return await self._stop_playback(session)
+            if action == "seek":
+                return await self._seek_playback(
+                    session, target_seconds=target_seconds,
+                    relative_seconds=relative_seconds,
+                )
             if action == "move":
                 return await self.move_to_next(guild_id, position)
             if action == "remove":
@@ -643,6 +668,7 @@ class VoiceManager:
         session.playlist.clear()
         session.pending_skips = 0
         session.is_playing = False
+        session.playback_ready = False
         session.idle_seconds = 0
         self._cancel_prefetch(session)
         preparation_task = session.preparation_task
@@ -695,6 +721,125 @@ class VoiceManager:
                 logger.debug(f"[KookMusic] 停止播放回调异常: {exc}")
         self._ensure_idle_check()
         return True, "已停止播放并清空队列，保留语音连接"
+
+    async def _seek_playback(
+        self, session: GuildSession, *, target_seconds: float | None,
+        relative_seconds: float | None,
+    ) -> tuple[bool, str]:
+        """Replace only the current decoder while retaining the queue and RTP relay."""
+        player = session.ffmpeg_player
+        song = session.current_song
+        if (
+            self._closing or getattr(session.voice_client, "remote_removed", False)
+            or not session.is_playing or not session.playback_ready
+            or session.pending_skips > 0 or session.seek_in_progress
+            or session.preparation_task is not None or not player.is_playing
+            or song is None or not song.playback_source
+        ):
+            return False, "当前未在播放或正在准备/切换歌曲，请稍后再跳转"
+        if (target_seconds is None) == (relative_seconds is None):
+            return False, "请提供一个有效的跳转时间"
+        supplied = relative_seconds if relative_seconds is not None else target_seconds
+        if (
+            isinstance(supplied, bool) or not isinstance(supplied, (int, float))
+        ):
+            return False, "请提供有限的跳转时间"
+        try:
+            target = float(supplied)
+            duration_seconds = float(song.duration) / 1000
+        except (OverflowError, TypeError, ValueError):
+            return False, "请提供有限的跳转时间和有效歌曲时长"
+        if not math.isfinite(target):
+            return False, "请提供有限的跳转时间"
+        if (
+            isinstance(song.duration, bool) or not isinstance(song.duration, (int, float))
+            or not math.isfinite(duration_seconds) or duration_seconds <= 0
+        ):
+            return False, "歌曲时长未知，暂时不能跳转"
+        if relative_seconds is not None:
+            elapsed = getattr(player, "played_seconds", None)
+            if (
+                isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
+                or not math.isfinite(elapsed) or elapsed < 0
+            ):
+                elapsed = max(0.0, time.monotonic() - session.playback_started_at)
+            target += session.playback_offset_seconds + elapsed
+            if supplied < 0:
+                target = max(0.0, target)
+        if target < 0 or target >= duration_seconds:
+            return False, "跳转时间必须在歌曲开头与结束之前的范围内"
+        now = time.monotonic()
+        if session.seek_cooldown_until > now:
+            remaining = math.ceil(session.seek_cooldown_until - now)
+            return False, f"跳转操作冷却中，请等待 {remaining} 秒"
+
+        guild_id = session.guild_id
+        session.seek_in_progress = True
+        session.seek_cooldown_until = now + self.seek_cooldown_seconds
+        session.playback_ready = False
+        session.playback_generation += 1
+        tasks = list(dict.fromkeys(
+            task for task in (
+                self._playback_tasks.pop(guild_id, None),
+                self._retry_tasks.pop(guild_id, None),
+            )
+            if task is not None and task is not asyncio.current_task()
+        ))
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # Card delivery may shield an HTTP receipt/cleanup after cancellation.
+        # Keep tracking it for stop/unload, but do not delay the audio swap.
+        for notification in tuple(session.notification_tasks):
+            if notification is not asyncio.current_task() and not notification.done():
+                notification.cancel()
+        replacement = asyncio.create_task(
+            self._restart_seek_decoder(session, song, target, tasks)
+        )
+        cancelled = False
+        try:
+            # Keep the guild lock until the replace operation commits, even if
+            # the command caller is cancelled during decoder process reaping.
+            while not replacement.done():
+                try:
+                    await asyncio.shield(replacement)
+                except asyncio.CancelledError:
+                    cancelled = True
+            result = replacement.result()
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
+        finally:
+            session.seek_in_progress = False
+
+    async def _restart_seek_decoder(
+        self, session: GuildSession, song: Song, target: float,
+        tasks: list[asyncio.Task],
+    ) -> tuple[bool, str]:
+        player = session.ffmpeg_player
+        guild_id = session.guild_id
+        await player.stop()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # Finish the prior generation before allowing a cancellation-resistant
+        # decoder startup to race with the replacement.
+        await player.stop()
+        if (
+            self.sessions.get(guild_id) is not session
+            or session.current_song is not song or self._closing
+            or getattr(session.voice_client, "remote_removed", False)
+        ):
+            return False, "播放会话已结束，已取消跳转"
+        self._clear_stream_resume_state(song)
+        song.provider_data[self._STREAM_RESUME_OFFSET_KEY] = target
+        session.playback_started_at = 0.0
+        session.playback_offset_seconds = target
+        session.playback_retry_count = 0
+        session.idle_seconds = 0
+        self._start_playback_loop(guild_id)
+        whole = int(target)
+        timestamp = f"{whole // 3600}:{whole // 60 % 60:02d}:{whole % 60:02d}"
+        return True, f"已请求跳转到 {timestamp}"
 
     async def toggle_loop(self, guild_id: str) -> tuple[bool, str]:
         """切换循环模式"""
@@ -1079,11 +1224,13 @@ class VoiceManager:
         song.provider_data[self._STREAM_NOTIFIED_KEY] = True
         queue_size = len(session.playlist)
         loop_name = session.loop_mode_name
+        generation = session.playback_generation
 
         async def notify():
             try:
                 if (
                     self.sessions.get(session.guild_id) is not session
+                    or session.playback_generation != generation
                     or session.current_song is not song
                     or session.pending_skips > 0
                 ):
@@ -1125,6 +1272,7 @@ class VoiceManager:
         session.is_playing = True
         try:
             while is_current():
+                session.playback_ready = False
                 if not session.playlist or getattr(
                     session.voice_client, "remote_removed", False
                 ):
@@ -1325,6 +1473,7 @@ class VoiceManager:
                 segment_started_at = time.monotonic()
                 session.playback_started_at = segment_started_at
                 session.playback_offset_seconds = resume_offset
+                session.playback_ready = True
 
                 self._sync_prefetch(session)
                 self._schedule_song_notification(session, song)
@@ -1351,6 +1500,7 @@ class VoiceManager:
 
                 # 等待播放完成（带超时保护）
                 playback_completed = await player.wait_until_done(timeout=timeout)
+                session.playback_ready = False
                 played_seconds = getattr(player, "played_seconds", None)
                 if (
                     isinstance(played_seconds, (int, float))
@@ -1431,6 +1581,7 @@ class VoiceManager:
             logger.error(f"[KookMusic] 播放循环异常: {e}")
             retry_needed = True
         finally:
+            session.playback_ready = False
             session.is_playing = False
             self._cancel_prefetch(session)
             # 确保当前歌曲已停止（不停中继进程，由 _cleanup_session 处理）
@@ -1600,6 +1751,7 @@ class VoiceManager:
         session.playback_retry_count = 0
         session.playback_started_at = 0.0
         session.playback_offset_seconds = 0.0
+        session.playback_ready = False
 
         logger.info(f"[KookMusic] 会话已清理: {guild_id}")
 
